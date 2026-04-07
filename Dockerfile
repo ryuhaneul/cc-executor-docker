@@ -4,6 +4,9 @@ RUN npm install -g @anthropic-ai/claude-code && \
     apt-get update && apt-get install -y --no-install-recommends python3 && \
     rm -rf /var/lib/apt/lists/*
 
+RUN mkdir -p /root/.claude && \
+    ln -sf /root/.claude/.claude.json /root/.claude.json
+
 WORKDIR /app
 COPY server.py .
 RUN mkdir -p /app/workdir
