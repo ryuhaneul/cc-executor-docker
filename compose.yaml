@@ -1,0 +1,15 @@
+services:
+  cc-executor:
+    build: .
+    container_name: cc-executor
+    restart: unless-stopped
+    ports:
+      - "${CC_PORT:-9100}:9100"
+    environment:
+      - CC_API_KEY=${CC_API_KEY}
+      - CC_TIMEOUT=${CC_TIMEOUT:-300}
+    volumes:
+      - cc-auth:/root/.claude
+
+volumes:
+  cc-auth:
