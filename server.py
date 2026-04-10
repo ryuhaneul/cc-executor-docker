@@ -31,12 +31,18 @@ MODEL_MAP = {
     "claude-opus-4": "opus",
     "claude-sonnet-4": "sonnet",
     "claude-haiku-4": "haiku",
+    "cc-executor/opus": "opus",
+    "cc-executor/sonnet": "sonnet",
+    "cc-executor/haiku": "haiku",
 }
 
 AVAILABLE_MODELS = [
     {"id": "opus", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
     {"id": "sonnet", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
     {"id": "haiku", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
+    {"id": "cc-executor/opus", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
+    {"id": "cc-executor/sonnet", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
+    {"id": "cc-executor/haiku", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
 ]
 
 
