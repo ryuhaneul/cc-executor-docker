@@ -60,6 +60,7 @@ def _run_claude(model, prompt, system_prompt=None, max_turns=None, allowed_tools
         for tool in allowed_tools:
             cmd += ["--allowedTools", tool]
 
+    print(f"[DEBUG] cmd={' '.join(cmd)}", file=sys.stderr)
     try:
         result = subprocess.run(
             cmd,
@@ -72,6 +73,9 @@ def _run_claude(model, prompt, system_prompt=None, max_turns=None, allowed_tools
         if result.returncode == 0:
             return True, result.stdout.strip(), None
         else:
+            print(f"[ERROR] returncode={result.returncode}", file=sys.stderr)
+            print(f"[ERROR] stderr={result.stderr.strip()[:500]}", file=sys.stderr)
+            print(f"[ERROR] stdout={result.stdout.strip()[:200]}", file=sys.stderr)
             return False, result.stdout.strip(), result.stderr.strip()
     except subprocess.TimeoutExpired:
         return False, "", "timeout"
@@ -171,8 +175,12 @@ class Handler(BaseHTTPRequestHandler):
         )
 
         if not ok:
+            err_msg = error or "Generation failed"
+            print(f"[ERROR] model={model} error={err_msg}", file=sys.stderr)
+            if output:
+                print(f"[ERROR] stdout={output[:500]}", file=sys.stderr)
             self._json_response(500, {
-                "error": {"message": error or "Generation failed", "type": "server_error"}
+                "error": {"message": err_msg, "type": "server_error"}
             })
             return
 
