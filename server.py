@@ -22,16 +22,16 @@ WORKDIR = "/app/workdir"
 
 # Model name mapping: OpenAI-style names → Claude Code CLI model names
 MODEL_MAP = {
-    "opus": "opus",
+    "opus": "claude-opus-4-7",
     "sonnet": "sonnet",
     "haiku": "haiku",
-    "claude-opus": "opus",
+    "claude-opus": "claude-opus-4-7",
     "claude-sonnet": "sonnet",
     "claude-haiku": "haiku",
-    "claude-opus-4": "opus",
+    "claude-opus-4": "claude-opus-4-7",
     "claude-sonnet-4": "sonnet",
     "claude-haiku-4": "haiku",
-    "cc-executor/opus": "opus",
+    "cc-executor/opus": "claude-opus-4-7",
     "cc-executor/sonnet": "sonnet",
     "cc-executor/haiku": "haiku",
 }
