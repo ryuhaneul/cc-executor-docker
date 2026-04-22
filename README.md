@@ -210,6 +210,30 @@ References:
 - <https://code.claude.com/docs/en/legal-and-compliance>
 - <https://support.claude.com/en/articles/11145838-using-claude-code-with-your-max-plan>
 
+## Credits
+
+The OAuth 2.0 + PKCE flow in `/admin/oauth/*` was implemented by
+studying **[grll/claude-code-login](https://github.com/grll/claude-code-login)**,
+which reverse-engineered the published endpoints and client id used by
+the official `claude auth login` command. This project reuses the same
+public OAuth client id, authorize URL, token URL, redirect URI, and
+scopes — they are Anthropic's published interface, not workarounds or
+private APIs. Big thanks to [@grll](https://github.com/grll) for the
+reference implementation that made a cleanly self-contained version
+possible here.
+
+Specific bits borrowed (structure, not code):
+
+- PKCE derivation: `code_verifier = base64url(os.urandom(32))`,
+  `code_challenge = base64url(sha256(code_verifier))`
+- Authorize URL parameters (including the `code=true` flag that makes
+  Anthropic return the code on a display page rather than redirecting
+  into the terminal flow)
+- Token endpoint payload shape (JSON, `grant_type=authorization_code`
+  + `code_verifier`)
+- Credentials file schema (`~/.claude/.credentials.json` with the
+  `claudeAiOauth` wrapper object)
+
 ## License
 
 [MIT](./LICENSE) — for the proxy code in this repo only. The bundled
