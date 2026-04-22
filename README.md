@@ -10,42 +10,50 @@ OpenAI-compatible API proxy for Claude Code CLI. Wraps `claude --print` in a Doc
 | GET | `/v1/models` | Bearer | List available models |
 | GET | `/health` | None | Health check |
 | GET | `/admin/status` | Bearer | Proxy `claude auth status` → `{loggedIn, authMethod, apiProvider}` |
-| POST | `/admin/credentials` | Bearer | **Recommended.** Body `{credentials: {claudeAiOauth: {...}}}` — writes the bundle verbatim to `/root/.claude/.credentials.json` (0600). Front-ends should run the OAuth flow themselves and POST the resulting credentials here. |
+| POST | `/admin/oauth/start` | Bearer | Begin an OAuth 2.0 + PKCE login. Returns `{session_id, url}` — open the URL in a browser, approve, copy the resulting `code#state` blob. |
+| POST | `/admin/oauth/complete` | Bearer | Body `{session_id, code}`. Exchanges the code against Anthropic's token endpoint and writes the bundle to `/root/.claude/.credentials.json` (0600). |
+| POST | `/admin/credentials` | Bearer | Manual fallback. Body `{credentials: {claudeAiOauth: {...}}}` — writes the bundle verbatim. Use when a valid `.credentials.json` already exists (e.g. produced by `claude auth login` on another machine). |
 | POST | `/admin/logout` | Bearer | Run `claude auth logout` |
-| POST | `/admin/login/start` | Bearer | (Legacy/experimental.) Spawn `claude auth login` inside a `pty.openpty()` master, scrape the OAuth URL. Useful as a probe but the CLI is opaque to programmatic stdin paste. |
-| POST | `/admin/login/complete` | Bearer | (Legacy/experimental.) Wait for `claude auth status` to flip to `loggedIn` while the spawned CLI does its own polling. Inconsistent in practice. |
 
 ### How to authenticate
 
-1. **Run the OAuth flow on a host with a browser** (your laptop, a CI
-   secret pickup, etc.). The published Claude Code OAuth client id and
-   PKCE endpoints are documented here for completeness:
-   - Authorize: `https://claude.ai/oauth/authorize`
-   - Token: `https://console.anthropic.com/v1/oauth/token`
-   - Client id: `9d1c250a-e61b-44d9-88ed-5944d1962f5e`
-   - Redirect URI: `https://console.anthropic.com/oauth/code/callback`
-   - Scope: `org:create_api_key user:profile user:inference`
-   - Reference impl: <https://github.com/grll/claude-code-login>
-2. Take the resulting `{access_token, refresh_token, expires_in}` and
-   format as `~/.claude/.credentials.json`:
-   ```json
-   {
-     "claudeAiOauth": {
-       "accessToken": "sk-ant-oat01-...",
-       "refreshToken": "sk-ant-ort01-...",
-       "expiresAt": 1748658860401,
-       "scopes": ["user:inference", "user:profile"],
-       "isMax": true
-     }
-   }
-   ```
-3. POST it to `/admin/credentials` (or, equivalently, run
-   `claude auth login` inside the container once via `docker compose
-   exec -it cc-executor claude auth login` — both write the same file).
+The **preferred** path is the built-in OAuth flow — the CLI does not have
+to exist on the front-end user's machine, and the token never leaves the
+container:
 
-The session lives in the `cc-auth` named volume and persists across
-container restarts. Token refresh happens automatically on subsequent
-`claude --print` calls.
+1. `POST /admin/oauth/start` — receive `{session_id, url}`.
+2. Open `url` in a browser, log in with your Anthropic (Claude Max/Pro)
+   account, approve. Anthropic redirects to
+   `console.anthropic.com/oauth/code/callback` with the authorization
+   code in the URL fragment (`#code#state` style).
+3. `POST /admin/oauth/complete` with `{session_id, code}`. The `code`
+   can be the bare code, `code#state`, or the full callback URL — the
+   server normalizes. Response: `{ok, loggedIn, authMethod, expiresAt,
+   scopes}`.
+
+Internally the server uses the published Claude Code OAuth client id and
+PKCE endpoints — same as the official `claude auth login` flow:
+
+- Authorize: `https://claude.ai/oauth/authorize`
+- Token: `https://console.anthropic.com/v1/oauth/token`
+- Client id: `9d1c250a-e61b-44d9-88ed-5944d1962f5e`
+- Redirect URI: `https://console.anthropic.com/oauth/code/callback`
+- Scope: `org:create_api_key user:profile user:inference`
+- Reference impl: <https://github.com/grll/claude-code-login>
+
+OAuth session state (`session_id`, `code_verifier`, `state`) is kept in
+process memory with a 10-minute TTL. That's intentional — the state is
+an OAuth nonce, not a persistent credential. A container restart in the
+middle of a login just voids the in-flight URL and the user retries.
+
+The **resulting token** is persisted on disk at
+`/root/.claude/.credentials.json` inside the `cc-auth` named volume, so
+successful logins survive restarts and rebuilds. Token refresh happens
+automatically on subsequent `claude --print` calls.
+
+If you already have a `.credentials.json` (e.g. produced by
+`claude auth login` on another box, or exported from a past run), you
+can POST it to `/admin/credentials` to skip the OAuth dance entirely.
 
 ## Quick Start
 

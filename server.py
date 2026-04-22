@@ -4,20 +4,28 @@
 POST /v1/chat/completions  — OpenAI-compatible chat completions
 GET  /v1/models            — Available models
 GET  /health               — Health check
+
+Admin (Bearer-protected):
+  GET  /admin/status              — claude auth status
+  POST /admin/oauth/start         — begin OAuth 2.0 + PKCE flow
+  POST /admin/oauth/complete      — exchange code, save .credentials.json
+  POST /admin/credentials         — paste .credentials.json manually
+  POST /admin/logout              — claude auth logout
 """
 
-import fcntl
+import base64
+import hashlib
 import json
 import os
-import pty
 import re
-import select
-import struct
+import secrets
+import ssl
 import subprocess
 import sys
-import termios
-import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -139,77 +147,117 @@ def _run_claude_with_retry(model, prompt, system_prompt=None, max_turns=None, al
     return ok, output, error, None
 
 
-# ─── `claude auth login` session state (in-memory, process-local) ───
+# ─── OAuth 2.0 + PKCE state (in-memory, process-local) ───
 #
-# The auth-login flow needs a real PTY because the CLI uses Ink (React-for-
-# terminal) with `setRawMode()`; piping bytes via `subprocess.PIPE` gets
-# silently ignored. We spawn the CLI attached to a pty we opened in this
-# process with pty.openpty(), scrape the OAuth URL from the master side,
-# hand it to the caller, and when the caller posts the code back we write
-# it to the pty master + hit Enter.
+# We run the OAuth flow ourselves — same endpoints the official
+# `claude auth login` CLI hits, same published client_id. This keeps the
+# built-in CLI TUI out of the critical path (Ink's raw-mode stdin is
+# opaque to programmatic I/O; been there, lost hours to it).
 #
-# Sessions live in `_LOGIN_SESSIONS`, keyed by UUID, TTL 10 min.
+# Sessions are tiny: {state, code_verifier, created_at}, 10-minute TTL.
+# They're transient by design — a process restart just voids in-flight
+# logins (user retries, done). The *token* that comes out of the exchange
+# is persisted to /root/.claude/.credentials.json (cc-auth volume), so
+# completed logins survive restarts.
 
-_LOGIN_SESSIONS = {}  # id -> {proc, master_fd, accumulated, created_at}
-_LOGIN_TTL = 600
-_URL_RE = re.compile(r"https://[^\s\x00-\x1f]+")
+_AUTH_URL = "https://claude.ai/oauth/authorize"
+_TOKEN_URL = "https://console.anthropic.com/v1/oauth/token"
+_CLIENT_ID = os.environ.get(
+    "CC_OAUTH_CLIENT_ID",
+    "9d1c250a-e61b-44d9-88ed-5944d1962f5e",  # published Claude Code client_id
+)
+_REDIRECT_URI = "https://console.anthropic.com/oauth/code/callback"
+_SCOPE = "org:create_api_key user:profile user:inference"
+
+_OAUTH_SESSIONS = {}  # id -> {state, code_verifier, created_at}
+_OAUTH_TTL = 600
 
 
-def _reap_stale_sessions():
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _reap_oauth_sessions():
     now = time.time()
-    stale = [sid for sid, s in list(_LOGIN_SESSIONS.items()) if now - s["created_at"] > _LOGIN_TTL]
-    for sid in stale:
-        s = _LOGIN_SESSIONS.pop(sid, None)
-        if s:
-            try:
-                s["proc"].terminate()
-            except Exception:
-                pass
-            try:
-                os.close(s["master_fd"])
-            except Exception:
-                pass
+    for sid in list(_OAUTH_SESSIONS.keys()):
+        if now - _OAUTH_SESSIONS[sid]["created_at"] > _OAUTH_TTL:
+            _OAUTH_SESSIONS.pop(sid, None)
 
 
-def _read_until_url(master_fd, timeout=15.0):
-    """Block-read the pty master until we see a https:// URL. Returns (url, accumulated)."""
-    end = time.monotonic() + timeout
-    buf = b""
-    while time.monotonic() < end:
-        r, _, _ = select.select([master_fd], [], [], 0.25)
-        if master_fd in r:
-            try:
-                chunk = os.read(master_fd, 4096)
-            except OSError:
-                break
-            if not chunk:
-                break
-            buf += chunk
-            m = _URL_RE.search(buf.decode("utf-8", "replace"))
-            if m:
-                return m.group(0).rstrip(".,);"), buf
-        if len(buf) > 32768:
-            break
-    return None, buf
+def _normalize_code(raw):
+    """Accept bare code, 'code#state', or the full callback URL.
+    Returns (code, state_or_None). Empty code → ('', None)."""
+    raw = (raw or "").strip()
+    if not raw:
+        return "", None
+    if raw.startswith("http://") or raw.startswith("https://"):
+        parsed = urllib.parse.urlparse(raw)
+        qs = urllib.parse.parse_qs(parsed.query)
+        return (qs.get("code") or [""])[0], (qs.get("state") or [None])[0]
+    if "#" in raw:
+        code, _, state = raw.partition("#")
+        return code.strip(), state.strip() or None
+    if "&state=" in raw:
+        code, _, rest = raw.partition("&state=")
+        return code.strip(), rest.strip() or None
+    return raw, None
 
 
-def _drain_for(master_fd, seconds=2.0):
-    """Collect whatever's on the pty master for N seconds. Non-blocking."""
-    end = time.monotonic() + seconds
-    buf = b""
-    while time.monotonic() < end:
-        r, _, _ = select.select([master_fd], [], [], 0.15)
-        if master_fd in r:
-            try:
-                chunk = os.read(master_fd, 4096)
-            except OSError:
-                break
-            if not chunk:
-                break
-            buf += chunk
-        if len(buf) > 16384:
-            break
-    return buf
+def _exchange_code_for_token(code, code_verifier, state):
+    """POST to Anthropic's token endpoint. Returns (status, body_dict)."""
+    payload = json.dumps({
+        "grant_type": "authorization_code",
+        "client_id": _CLIENT_ID,
+        "code": code,
+        "redirect_uri": _REDIRECT_URI,
+        "code_verifier": code_verifier,
+        "state": state,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        _TOKEN_URL,
+        data=payload,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "cc-executor/oauth",
+        },
+    )
+    ctx = ssl.create_default_context()
+    try:
+        with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            body = json.loads(exc.read().decode("utf-8"))
+        except Exception:
+            body = {"error": {"message": f"HTTP {exc.code}"}}
+        return exc.code, body
+    except (urllib.error.URLError, TimeoutError) as exc:
+        return 0, {"error": {"message": f"network: {exc}"}}
+
+
+def _write_credentials(creds: dict) -> tuple[bool, str]:
+    """Atomically write to /root/.claude/.credentials.json (0600)."""
+    claude_dir = "/root/.claude"
+    os.makedirs(claude_dir, exist_ok=True)
+    target = os.path.join(claude_dir, ".credentials.json")
+    tmp = target + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(creds, fh, ensure_ascii=False)
+        try:
+            os.chmod(tmp, 0o600)
+        except Exception:
+            pass
+        os.replace(tmp, target)
+        return True, ""
+    except Exception as exc:
+        try:
+            os.unlink(tmp)
+        except Exception:
+            pass
+        return False, str(exc)
 
 
 def _claude_auth_status():
@@ -274,22 +322,19 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_chat_completions()
         elif self.path == "/admin/credentials":
             self._handle_set_credentials()
-        elif self.path == "/admin/login/start":
-            self._handle_login_start()
-        elif self.path == "/admin/login/complete":
-            self._handle_login_complete()
+        elif self.path == "/admin/oauth/start":
+            self._handle_oauth_start()
+        elif self.path == "/admin/oauth/complete":
+            self._handle_oauth_complete()
         elif self.path == "/admin/logout":
             self._handle_logout()
         else:
             self.send_error(404)
 
     # ── /admin/credentials ──
-    # Preferred auth path: the user runs `claude auth login` on their OWN
-    # machine (where the browser OAuth flow works fine), then copies the
-    # resulting `~/.claude/.credentials.json` content and pastes it here.
-    # We write it verbatim to /root/.claude/.credentials.json inside the
-    # container, and the `claude` CLI reads it on subsequent invocations.
-    # No browser/interactive-TUI fight needed.
+    # Manual fallback: paste the contents of an existing .credentials.json
+    # (e.g. produced by `claude auth login` on another machine). Prefer
+    # /admin/oauth/* — this exists for recovery scenarios.
     def _handle_set_credentials(self):
         if not self._check_auth():
             self._json_response(401, {"error": {"message": "Invalid API key"}})
@@ -303,26 +348,10 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(oauth, dict) or not oauth.get("accessToken"):
             self._json_response(422, {"error": {"message": "credentials.claudeAiOauth.accessToken missing"}})
             return
-        claude_dir = "/root/.claude"
-        os.makedirs(claude_dir, exist_ok=True)
-        target = os.path.join(claude_dir, ".credentials.json")
-        tmp = target + ".tmp"
-        try:
-            with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(creds, fh, ensure_ascii=False)
-            try:
-                os.chmod(tmp, 0o600)
-            except Exception:
-                pass
-            os.replace(tmp, target)
-        except Exception as exc:
-            try:
-                os.unlink(tmp)
-            except Exception:
-                pass
-            self._json_response(500, {"error": {"message": f"write failed: {exc}"}})
+        ok, err = _write_credentials(creds)
+        if not ok:
+            self._json_response(500, {"error": {"message": f"write failed: {err}"}})
             return
-
         status = _claude_auth_status()
         self._json_response(200, {
             "ok": bool(status.get("loggedIn")),
@@ -330,140 +359,111 @@ class Handler(BaseHTTPRequestHandler):
             "authMethod": status.get("authMethod"),
         })
 
-    # ── /admin/login/start ──
-
-    def _handle_login_start(self):
+    # ── /admin/oauth/start ──
+    # Generate a fresh PKCE pair + state, return the authorize URL.
+    # The caller opens the URL in a browser; Anthropic redirects back
+    # to console.anthropic.com/oauth/code/callback with "code#state" in
+    # the fragment. The user copies that blob and posts it to
+    # /admin/oauth/complete.
+    def _handle_oauth_start(self):
         if not self._check_auth():
             self._json_response(401, {"error": {"message": "Invalid API key"}})
             return
-        _reap_stale_sessions()
+        _reap_oauth_sessions()
 
-        master_fd, slave_fd = pty.openpty()
-        # Ink (claude CLI's TUI) won't enter raw mode without a known
-        # window size + TERM. Set both before spawning so the CLI reads
-        # stdin as typed input.
-        try:
-            winsize = struct.pack("HHHH", 40, 120, 0, 0)
-            fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, winsize)
-        except Exception:
-            pass
-        child_env = os.environ.copy()
-        child_env.setdefault("TERM", "xterm-256color")
-        child_env.setdefault("COLUMNS", "120")
-        child_env.setdefault("LINES", "40")
-        try:
-            proc = subprocess.Popen(
-                ["claude", "auth", "login"],
-                stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
-                close_fds=True, start_new_session=True,
-                env=child_env,
-            )
-        except Exception as exc:
-            os.close(master_fd)
-            os.close(slave_fd)
-            self._json_response(500, {"error": {"message": f"spawn failed: {exc}"}})
-            return
-        os.close(slave_fd)  # parent only keeps master
-
-        url, accumulated = _read_until_url(master_fd, timeout=15.0)
-        if not url:
-            try:
-                proc.terminate()
-            except Exception:
-                pass
-            try:
-                os.close(master_fd)
-            except Exception:
-                pass
-            self._json_response(504, {
-                "error": {"message": "did not receive OAuth URL from claude CLI"},
-                "tail": accumulated[-400:].decode("utf-8", "replace"),
-            })
-            return
+        state = secrets.token_hex(32)
+        code_verifier = _b64url(secrets.token_bytes(32))
+        code_challenge = _b64url(hashlib.sha256(code_verifier.encode("ascii")).digest())
 
         session_id = str(uuid.uuid4())
-        _LOGIN_SESSIONS[session_id] = {
-            "proc": proc,
-            "master_fd": master_fd,
-            "accumulated": accumulated,
+        _OAUTH_SESSIONS[session_id] = {
+            "state": state,
+            "code_verifier": code_verifier,
             "created_at": time.time(),
         }
-        self._json_response(200, {"session_id": session_id, "url": url})
+        qs = urllib.parse.urlencode({
+            "code": "true",
+            "client_id": _CLIENT_ID,
+            "response_type": "code",
+            "redirect_uri": _REDIRECT_URI,
+            "scope": _SCOPE,
+            "code_challenge": code_challenge,
+            "code_challenge_method": "S256",
+            "state": state,
+        })
+        self._json_response(200, {
+            "session_id": session_id,
+            "url": f"{_AUTH_URL}?{qs}",
+        })
 
-    # ── /admin/login/complete ──
-
-    def _handle_login_complete(self):
-        """Poll `claude auth status` while the spawned CLI does its own
-        polling against Anthropic. The CLI picks up the code automatically
-        once the user has authorized in their browser — stdin paste is
-        NOT required (verified via strace: CLI is doing HTTPS polling
-        against 160.79.104.10:443 instead of reading stdin). We optionally
-        still write the code to stdin as a belt-and-braces for CLI
-        versions that might expect it."""
+    # ── /admin/oauth/complete ──
+    # Accept {session_id, code}. The code can be bare, "code#state", or
+    # the full callback URL — we normalize. We POST to Anthropic's token
+    # endpoint, verify the bundle, then write it to .credentials.json.
+    def _handle_oauth_complete(self):
         if not self._check_auth():
             self._json_response(401, {"error": {"message": "Invalid API key"}})
             return
         body = self._read_json() or {}
         sid = body.get("session_id")
-        code = (body.get("code") or "").strip()
         if not sid:
             self._json_response(422, {"error": {"message": "session_id is required"}})
             return
-        sess = _LOGIN_SESSIONS.pop(sid, None)
+        sess = _OAUTH_SESSIONS.pop(sid, None)
         if not sess:
-            self._json_response(404, {"error": {"message": "login session not found or expired"}})
+            self._json_response(404, {"error": {"message": "login session expired or unknown"}})
             return
-        master_fd = sess["master_fd"]
-        proc = sess["proc"]
 
-        # Best-effort: stream the code into the CLI's stdin in several
-        # formats so whichever readline mode the CLI is in catches it.
-        # We also send the code multiple times over ~5 s so any early-
-        # race where the CLI is still mounting its input handler is
-        # absorbed.
-        if code:
-            for variant in (code + "\r\n", code + "\n", code + "\r"):
-                try:
-                    os.write(master_fd, variant.encode("utf-8"))
-                except Exception:
-                    pass
-                time.sleep(0.4)
+        code, state_from_payload = _normalize_code(body.get("code"))
+        if not code:
+            self._json_response(422, {"error": {"message": "authorization code is required"}})
+            return
+        if state_from_payload and state_from_payload != sess["state"]:
+            self._json_response(400, {"error": {"message": "state mismatch — paste came from a different session"}})
+            return
 
-        # Poll auth status up to ~90 s. Auth success causes the CLI process
-        # to exit on its own; we detect that too.
-        tail = b""
-        ok = False
-        deadline = time.monotonic() + 90.0
-        while time.monotonic() < deadline:
-            tail += _drain_for(master_fd, seconds=0.5)
-            status = _claude_auth_status()
-            if status.get("loggedIn"):
-                ok = True
-                break
-            if proc.poll() is not None:
-                # CLI exited — final status check
-                status = _claude_auth_status()
-                ok = bool(status.get("loggedIn"))
-                break
-            time.sleep(1.5)
+        status, tok = _exchange_code_for_token(code, sess["code_verifier"], sess["state"])
+        if status != 200 or not isinstance(tok, dict) or not tok.get("access_token"):
+            err = tok.get("error") if isinstance(tok, dict) else None
+            message = None
+            etype = None
+            if isinstance(err, dict):
+                message = err.get("message")
+                etype = err.get("type")
+            # Friendly translations for the ones we actually see in practice.
+            if etype == "rate_limit_error":
+                message = (message or "Anthropic rate limit") + " — 10~15분 후 다시 시도하세요"
+            elif etype == "invalid_request_error" and "code" in (message or "").lower():
+                message = "코드가 만료됐거나 잘못됐습니다 — 새로 발급해 주세요"
+            self._json_response(400 if status else 502, {
+                "ok": False,
+                "error": {"message": message or f"token exchange failed (HTTP {status})", "type": etype},
+            })
+            return
 
-        try:
-            os.close(master_fd)
-        except Exception:
-            pass
-        try:
-            if proc.poll() is None:
-                proc.terminate()
-        except Exception:
-            pass
+        expires_at_ms = (int(time.time()) + int(tok.get("expires_in") or 0)) * 1000
+        scopes = [s for s in (tok.get("scope") or _SCOPE).split() if s] or _SCOPE.split()
+        creds = {
+            "claudeAiOauth": {
+                "accessToken": tok["access_token"],
+                "refreshToken": tok.get("refresh_token"),
+                "expiresAt": expires_at_ms,
+                "scopes": scopes,
+                "isMax": True,
+            }
+        }
+        ok, err = _write_credentials(creds)
+        if not ok:
+            self._json_response(500, {"ok": False, "error": {"message": f"write failed: {err}"}})
+            return
 
         final = _claude_auth_status()
-        tail_txt = tail.decode("utf-8", "replace")[-600:]
-        self._json_response(200 if ok else 408, {
-            "ok": ok,
+        self._json_response(200, {
+            "ok": True,
             "loggedIn": bool(final.get("loggedIn")),
             "authMethod": final.get("authMethod"),
-            "tail": tail_txt,
+            "expiresAt": expires_at_ms,
+            "scopes": scopes,
         })
 
     # ── /admin/logout ──
