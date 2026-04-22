@@ -272,6 +272,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path == "/v1/chat/completions":
             self._handle_chat_completions()
+        elif self.path == "/admin/credentials":
+            self._handle_set_credentials()
         elif self.path == "/admin/login/start":
             self._handle_login_start()
         elif self.path == "/admin/login/complete":
@@ -280,6 +282,53 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_logout()
         else:
             self.send_error(404)
+
+    # ── /admin/credentials ──
+    # Preferred auth path: the user runs `claude auth login` on their OWN
+    # machine (where the browser OAuth flow works fine), then copies the
+    # resulting `~/.claude/.credentials.json` content and pastes it here.
+    # We write it verbatim to /root/.claude/.credentials.json inside the
+    # container, and the `claude` CLI reads it on subsequent invocations.
+    # No browser/interactive-TUI fight needed.
+    def _handle_set_credentials(self):
+        if not self._check_auth():
+            self._json_response(401, {"error": {"message": "Invalid API key"}})
+            return
+        body = self._read_json() or {}
+        creds = body.get("credentials")
+        if not isinstance(creds, dict):
+            self._json_response(422, {"error": {"message": "credentials must be an object"}})
+            return
+        oauth = creds.get("claudeAiOauth")
+        if not isinstance(oauth, dict) or not oauth.get("accessToken"):
+            self._json_response(422, {"error": {"message": "credentials.claudeAiOauth.accessToken missing"}})
+            return
+        claude_dir = "/root/.claude"
+        os.makedirs(claude_dir, exist_ok=True)
+        target = os.path.join(claude_dir, ".credentials.json")
+        tmp = target + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(creds, fh, ensure_ascii=False)
+            try:
+                os.chmod(tmp, 0o600)
+            except Exception:
+                pass
+            os.replace(tmp, target)
+        except Exception as exc:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+            self._json_response(500, {"error": {"message": f"write failed: {exc}"}})
+            return
+
+        status = _claude_auth_status()
+        self._json_response(200, {
+            "ok": bool(status.get("loggedIn")),
+            "loggedIn": bool(status.get("loggedIn")),
+            "authMethod": status.get("authMethod"),
+        })
 
     # ── /admin/login/start ──
 
@@ -367,12 +416,18 @@ class Handler(BaseHTTPRequestHandler):
         master_fd = sess["master_fd"]
         proc = sess["proc"]
 
-        # Optional best-effort stdin write (harmless if CLI ignores it).
+        # Best-effort: stream the code into the CLI's stdin in several
+        # formats so whichever readline mode the CLI is in catches it.
+        # We also send the code multiple times over ~5 s so any early-
+        # race where the CLI is still mounting its input handler is
+        # absorbed.
         if code:
-            try:
-                os.write(master_fd, code.encode("utf-8") + b"\r")
-            except Exception:
-                pass
+            for variant in (code + "\r\n", code + "\n", code + "\r"):
+                try:
+                    os.write(master_fd, variant.encode("utf-8"))
+                except Exception:
+                    pass
+                time.sleep(0.4)
 
         # Poll auth status up to ~90 s. Auth success causes the CLI process
         # to exit on its own; we detect that too.
