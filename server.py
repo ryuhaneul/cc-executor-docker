@@ -8,8 +8,12 @@ GET  /health               — Health check
 
 import json
 import os
+import pty
+import re
+import select
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -132,6 +136,94 @@ def _run_claude_with_retry(model, prompt, system_prompt=None, max_turns=None, al
     return ok, output, error, None
 
 
+# ─── `claude auth login` session state (in-memory, process-local) ───
+#
+# The auth-login flow needs a real PTY because the CLI uses Ink (React-for-
+# terminal) with `setRawMode()`; piping bytes via `subprocess.PIPE` gets
+# silently ignored. We spawn the CLI attached to a pty we opened in this
+# process with pty.openpty(), scrape the OAuth URL from the master side,
+# hand it to the caller, and when the caller posts the code back we write
+# it to the pty master + hit Enter.
+#
+# Sessions live in `_LOGIN_SESSIONS`, keyed by UUID, TTL 10 min.
+
+_LOGIN_SESSIONS = {}  # id -> {proc, master_fd, accumulated, created_at}
+_LOGIN_TTL = 600
+_URL_RE = re.compile(r"https://[^\s\x00-\x1f]+")
+
+
+def _reap_stale_sessions():
+    now = time.time()
+    stale = [sid for sid, s in list(_LOGIN_SESSIONS.items()) if now - s["created_at"] > _LOGIN_TTL]
+    for sid in stale:
+        s = _LOGIN_SESSIONS.pop(sid, None)
+        if s:
+            try:
+                s["proc"].terminate()
+            except Exception:
+                pass
+            try:
+                os.close(s["master_fd"])
+            except Exception:
+                pass
+
+
+def _read_until_url(master_fd, timeout=15.0):
+    """Block-read the pty master until we see a https:// URL. Returns (url, accumulated)."""
+    end = time.monotonic() + timeout
+    buf = b""
+    while time.monotonic() < end:
+        r, _, _ = select.select([master_fd], [], [], 0.25)
+        if master_fd in r:
+            try:
+                chunk = os.read(master_fd, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf += chunk
+            m = _URL_RE.search(buf.decode("utf-8", "replace"))
+            if m:
+                return m.group(0).rstrip(".,);"), buf
+        if len(buf) > 32768:
+            break
+    return None, buf
+
+
+def _drain_for(master_fd, seconds=2.0):
+    """Collect whatever's on the pty master for N seconds. Non-blocking."""
+    end = time.monotonic() + seconds
+    buf = b""
+    while time.monotonic() < end:
+        r, _, _ = select.select([master_fd], [], [], 0.15)
+        if master_fd in r:
+            try:
+                chunk = os.read(master_fd, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf += chunk
+        if len(buf) > 16384:
+            break
+    return buf
+
+
+def _claude_auth_status():
+    """Return dict parsed from `claude auth status` JSON, or {}."""
+    try:
+        out = subprocess.run(
+            ["claude", "auth", "status"],
+            capture_output=True, text=True, timeout=10,
+        )
+        m = re.search(r"\{.*?\}", out.stdout, re.DOTALL)
+        if m:
+            return json.loads(m.group(0))
+    except Exception:
+        pass
+    return {}
+
+
 class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
@@ -159,6 +251,16 @@ class Handler(BaseHTTPRequestHandler):
                 self._json_response(401, {"error": {"message": "Invalid API key", "type": "authentication_error"}})
                 return
             self._json_response(200, {"object": "list", "data": AVAILABLE_MODELS})
+        elif self.path == "/admin/status":
+            if not self._check_auth():
+                self._json_response(401, {"error": {"message": "Invalid API key"}})
+                return
+            status = _claude_auth_status()
+            self._json_response(200, {
+                "loggedIn": bool(status.get("loggedIn")),
+                "authMethod": status.get("authMethod"),
+                "apiProvider": status.get("apiProvider"),
+            })
         else:
             self.send_error(404)
 
@@ -167,8 +269,125 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path == "/v1/chat/completions":
             self._handle_chat_completions()
+        elif self.path == "/admin/login/start":
+            self._handle_login_start()
+        elif self.path == "/admin/login/complete":
+            self._handle_login_complete()
+        elif self.path == "/admin/logout":
+            self._handle_logout()
         else:
             self.send_error(404)
+
+    # ── /admin/login/start ──
+
+    def _handle_login_start(self):
+        if not self._check_auth():
+            self._json_response(401, {"error": {"message": "Invalid API key"}})
+            return
+        _reap_stale_sessions()
+
+        master_fd, slave_fd = pty.openpty()
+        try:
+            proc = subprocess.Popen(
+                ["claude", "auth", "login"],
+                stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
+                close_fds=True, start_new_session=True,
+            )
+        except Exception as exc:
+            os.close(master_fd)
+            os.close(slave_fd)
+            self._json_response(500, {"error": {"message": f"spawn failed: {exc}"}})
+            return
+        os.close(slave_fd)  # parent only keeps master
+
+        url, accumulated = _read_until_url(master_fd, timeout=15.0)
+        if not url:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            try:
+                os.close(master_fd)
+            except Exception:
+                pass
+            self._json_response(504, {
+                "error": {"message": "did not receive OAuth URL from claude CLI"},
+                "tail": accumulated[-400:].decode("utf-8", "replace"),
+            })
+            return
+
+        session_id = str(uuid.uuid4())
+        _LOGIN_SESSIONS[session_id] = {
+            "proc": proc,
+            "master_fd": master_fd,
+            "accumulated": accumulated,
+            "created_at": time.time(),
+        }
+        self._json_response(200, {"session_id": session_id, "url": url})
+
+    # ── /admin/login/complete ──
+
+    def _handle_login_complete(self):
+        if not self._check_auth():
+            self._json_response(401, {"error": {"message": "Invalid API key"}})
+            return
+        body = self._read_json() or {}
+        sid = body.get("session_id")
+        code = (body.get("code") or "").strip()
+        if not sid or not code:
+            self._json_response(422, {"error": {"message": "session_id and code are required"}})
+            return
+        sess = _LOGIN_SESSIONS.pop(sid, None)
+        if not sess:
+            self._json_response(404, {"error": {"message": "login session not found or expired"}})
+            return
+        master_fd = sess["master_fd"]
+        proc = sess["proc"]
+        try:
+            # Write code + Enter. PTY is a real TTY so Ink sees this as typed input.
+            os.write(master_fd, code.encode("utf-8") + b"\r")
+            # Give the CLI a few seconds to process and exit.
+            tail = _drain_for(master_fd, seconds=8.0)
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                tail += _drain_for(master_fd, seconds=3.0)
+        finally:
+            try:
+                os.close(master_fd)
+            except Exception:
+                pass
+            try:
+                if proc.poll() is None:
+                    proc.terminate()
+            except Exception:
+                pass
+
+        # Authoritative check: did the session actually save?
+        status = _claude_auth_status()
+        ok = bool(status.get("loggedIn"))
+        tail_txt = tail.decode("utf-8", "replace")[-600:]
+        self._json_response(200 if ok else 400, {
+            "ok": ok,
+            "loggedIn": ok,
+            "authMethod": status.get("authMethod"),
+            "tail": tail_txt,
+        })
+
+    # ── /admin/logout ──
+
+    def _handle_logout(self):
+        if not self._check_auth():
+            self._json_response(401, {"error": {"message": "Invalid API key"}})
+            return
+        try:
+            out = subprocess.run(
+                ["claude", "auth", "logout"],
+                capture_output=True, text=True, timeout=10,
+            )
+            self._json_response(200, {"ok": out.returncode == 0, "stdout": out.stdout[-400:]})
+        except Exception as exc:
+            self._json_response(500, {"error": {"message": str(exc)}})
 
     def _read_json(self):
         length = int(self.headers.get("Content-Length", 0))

@@ -9,6 +9,16 @@ OpenAI-compatible API proxy for Claude Code CLI. Wraps `claude --print` in a Doc
 | POST | `/v1/chat/completions` | Bearer | OpenAI-compatible chat completions |
 | GET | `/v1/models` | Bearer | List available models |
 | GET | `/health` | None | Health check |
+| POST | `/admin/login/start` | Bearer | Spawn `claude auth login` inside a PTY, scrape the OAuth URL from stdout, return `{session_id, url}` |
+| POST | `/admin/login/complete` | Bearer | Body `{session_id, code}` — write the OAuth code to the spawned CLI's stdin (Enter included), then probe `claude auth status`. Returns `{ok, loggedIn, tail}` |
+| GET | `/admin/status` | Bearer | Proxy `claude auth status` → `{loggedIn, authMethod, apiProvider}` |
+| POST | `/admin/logout` | Bearer | Run `claude auth logout` |
+
+The admin-login endpoints drive `claude auth login` through a real PTY
+opened with `pty.openpty()`. This is the only programmatic path that
+works — piping via `subprocess.PIPE`, or even via `docker exec -i`'s
+hijacked stdin, is silently ignored by the CLI because Ink (its
+React-for-terminal UI) only reads input when stdin is a real TTY.
 
 ## Quick Start
 
