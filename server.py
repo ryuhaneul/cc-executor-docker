@@ -6,13 +6,16 @@ GET  /v1/models            — Available models
 GET  /health               — Health check
 """
 
+import fcntl
 import json
 import os
 import pty
 import re
 import select
+import struct
 import subprocess
 import sys
+import termios
 import threading
 import time
 import uuid
@@ -287,11 +290,24 @@ class Handler(BaseHTTPRequestHandler):
         _reap_stale_sessions()
 
         master_fd, slave_fd = pty.openpty()
+        # Ink (claude CLI's TUI) won't enter raw mode without a known
+        # window size + TERM. Set both before spawning so the CLI reads
+        # stdin as typed input.
+        try:
+            winsize = struct.pack("HHHH", 40, 120, 0, 0)
+            fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, winsize)
+        except Exception:
+            pass
+        child_env = os.environ.copy()
+        child_env.setdefault("TERM", "xterm-256color")
+        child_env.setdefault("COLUMNS", "120")
+        child_env.setdefault("LINES", "40")
         try:
             proc = subprocess.Popen(
                 ["claude", "auth", "login"],
                 stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
                 close_fds=True, start_new_session=True,
+                env=child_env,
             )
         except Exception as exc:
             os.close(master_fd)
