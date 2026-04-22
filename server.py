@@ -344,14 +344,21 @@ class Handler(BaseHTTPRequestHandler):
     # ── /admin/login/complete ──
 
     def _handle_login_complete(self):
+        """Poll `claude auth status` while the spawned CLI does its own
+        polling against Anthropic. The CLI picks up the code automatically
+        once the user has authorized in their browser — stdin paste is
+        NOT required (verified via strace: CLI is doing HTTPS polling
+        against 160.79.104.10:443 instead of reading stdin). We optionally
+        still write the code to stdin as a belt-and-braces for CLI
+        versions that might expect it."""
         if not self._check_auth():
             self._json_response(401, {"error": {"message": "Invalid API key"}})
             return
         body = self._read_json() or {}
         sid = body.get("session_id")
         code = (body.get("code") or "").strip()
-        if not sid or not code:
-            self._json_response(422, {"error": {"message": "session_id and code are required"}})
+        if not sid:
+            self._json_response(422, {"error": {"message": "session_id is required"}})
             return
         sess = _LOGIN_SESSIONS.pop(sid, None)
         if not sess:
@@ -359,34 +366,48 @@ class Handler(BaseHTTPRequestHandler):
             return
         master_fd = sess["master_fd"]
         proc = sess["proc"]
-        try:
-            # Write code + Enter. PTY is a real TTY so Ink sees this as typed input.
-            os.write(master_fd, code.encode("utf-8") + b"\r")
-            # Give the CLI a few seconds to process and exit.
-            tail = _drain_for(master_fd, seconds=8.0)
+
+        # Optional best-effort stdin write (harmless if CLI ignores it).
+        if code:
             try:
-                proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                tail += _drain_for(master_fd, seconds=3.0)
-        finally:
-            try:
-                os.close(master_fd)
-            except Exception:
-                pass
-            try:
-                if proc.poll() is None:
-                    proc.terminate()
+                os.write(master_fd, code.encode("utf-8") + b"\r")
             except Exception:
                 pass
 
-        # Authoritative check: did the session actually save?
-        status = _claude_auth_status()
-        ok = bool(status.get("loggedIn"))
+        # Poll auth status up to ~90 s. Auth success causes the CLI process
+        # to exit on its own; we detect that too.
+        tail = b""
+        ok = False
+        deadline = time.monotonic() + 90.0
+        while time.monotonic() < deadline:
+            tail += _drain_for(master_fd, seconds=0.5)
+            status = _claude_auth_status()
+            if status.get("loggedIn"):
+                ok = True
+                break
+            if proc.poll() is not None:
+                # CLI exited — final status check
+                status = _claude_auth_status()
+                ok = bool(status.get("loggedIn"))
+                break
+            time.sleep(1.5)
+
+        try:
+            os.close(master_fd)
+        except Exception:
+            pass
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+        except Exception:
+            pass
+
+        final = _claude_auth_status()
         tail_txt = tail.decode("utf-8", "replace")[-600:]
-        self._json_response(200 if ok else 400, {
+        self._json_response(200 if ok else 408, {
             "ok": ok,
-            "loggedIn": ok,
-            "authMethod": status.get("authMethod"),
+            "loggedIn": bool(final.get("loggedIn")),
+            "authMethod": final.get("authMethod"),
             "tail": tail_txt,
         })
 
