@@ -9,16 +9,43 @@ OpenAI-compatible API proxy for Claude Code CLI. Wraps `claude --print` in a Doc
 | POST | `/v1/chat/completions` | Bearer | OpenAI-compatible chat completions |
 | GET | `/v1/models` | Bearer | List available models |
 | GET | `/health` | None | Health check |
-| POST | `/admin/login/start` | Bearer | Spawn `claude auth login` inside a PTY, scrape the OAuth URL from stdout, return `{session_id, url}` |
-| POST | `/admin/login/complete` | Bearer | Body `{session_id, code}` — write the OAuth code to the spawned CLI's stdin (Enter included), then probe `claude auth status`. Returns `{ok, loggedIn, tail}` |
 | GET | `/admin/status` | Bearer | Proxy `claude auth status` → `{loggedIn, authMethod, apiProvider}` |
+| POST | `/admin/credentials` | Bearer | **Recommended.** Body `{credentials: {claudeAiOauth: {...}}}` — writes the bundle verbatim to `/root/.claude/.credentials.json` (0600). Front-ends should run the OAuth flow themselves and POST the resulting credentials here. |
 | POST | `/admin/logout` | Bearer | Run `claude auth logout` |
+| POST | `/admin/login/start` | Bearer | (Legacy/experimental.) Spawn `claude auth login` inside a `pty.openpty()` master, scrape the OAuth URL. Useful as a probe but the CLI is opaque to programmatic stdin paste. |
+| POST | `/admin/login/complete` | Bearer | (Legacy/experimental.) Wait for `claude auth status` to flip to `loggedIn` while the spawned CLI does its own polling. Inconsistent in practice. |
 
-The admin-login endpoints drive `claude auth login` through a real PTY
-opened with `pty.openpty()`. This is the only programmatic path that
-works — piping via `subprocess.PIPE`, or even via `docker exec -i`'s
-hijacked stdin, is silently ignored by the CLI because Ink (its
-React-for-terminal UI) only reads input when stdin is a real TTY.
+### How to authenticate
+
+1. **Run the OAuth flow on a host with a browser** (your laptop, a CI
+   secret pickup, etc.). The published Claude Code OAuth client id and
+   PKCE endpoints are documented here for completeness:
+   - Authorize: `https://claude.ai/oauth/authorize`
+   - Token: `https://console.anthropic.com/v1/oauth/token`
+   - Client id: `9d1c250a-e61b-44d9-88ed-5944d1962f5e`
+   - Redirect URI: `https://console.anthropic.com/oauth/code/callback`
+   - Scope: `org:create_api_key user:profile user:inference`
+   - Reference impl: <https://github.com/grll/claude-code-login>
+2. Take the resulting `{access_token, refresh_token, expires_in}` and
+   format as `~/.claude/.credentials.json`:
+   ```json
+   {
+     "claudeAiOauth": {
+       "accessToken": "sk-ant-oat01-...",
+       "refreshToken": "sk-ant-ort01-...",
+       "expiresAt": 1748658860401,
+       "scopes": ["user:inference", "user:profile"],
+       "isMax": true
+     }
+   }
+   ```
+3. POST it to `/admin/credentials` (or, equivalently, run
+   `claude auth login` inside the container once via `docker compose
+   exec -it cc-executor claude auth login` — both write the same file).
+
+The session lives in the `cc-auth` named volume and persists across
+container restarts. Token refresh happens automatically on subsequent
+`claude --print` calls.
 
 ## Quick Start
 
@@ -148,3 +175,35 @@ The CLI is invoked with `--setting-sources ""` which disables loading of
 user/project/local `settings.json`. This means settings-based config (CLAUDE.md
 auto-discovery, MCP servers, hooks, etc.) is **not** applied — only flags
 passed explicitly by this proxy take effect.
+
+## Anthropic Terms of Service
+
+This image bundles the **official** `@anthropic-ai/claude-code` CLI from
+npm and authenticates against Anthropic's published OAuth endpoints — the
+same endpoints the official `claude auth login` interactive flow uses.
+Nothing here exfiltrates the token to a different API client or
+re-implements Anthropic's inference protocol.
+
+That said, Anthropic's consumer terms for Free/Pro/Max subscription
+credentials prohibit:
+
+- Routing subscription credentials through a third-party product on
+  behalf of other end users
+- Sharing or redistributing OAuth tokens
+- Bulk/automated use that exceeds the product's intended scope
+
+This image is intended for **personal, single-user** deployment — your
+own Claude subscription serving your own workloads on your own machine.
+For multi-user products or commercial integrations, use the Anthropic
+Console API (`ANTHROPIC_API_KEY`) instead, which is governed by the
+Commercial Terms.
+
+References:
+- <https://code.claude.com/docs/en/legal-and-compliance>
+- <https://support.claude.com/en/articles/11145838-using-claude-code-with-your-max-plan>
+
+## License
+
+[MIT](./LICENSE) — for the proxy code in this repo only. The bundled
+`@anthropic-ai/claude-code` CLI is Anthropic software with its own
+license; see `https://anthropic.com/legal` for Anthropic's terms.
