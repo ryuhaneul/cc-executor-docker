@@ -20,38 +20,50 @@ API_KEY = os.environ.get("CC_API_KEY", "")
 TIMEOUT = int(os.environ.get("CC_TIMEOUT", "300"))
 WORKDIR = "/app/workdir"
 
-# Model name mapping: OpenAI-style names → Claude Code CLI model names
+RETRY_DELAY_SECONDS = 5
+
+# Model name mapping: OpenAI-style names → Claude Code CLI model names.
+# Default aliases point at 1M context via the `[1m]` suffix (included on Max
+# plan for Opus; Sonnet depends on account). Use *200k variants to opt out.
 MODEL_MAP = {
-    "opus": "opus",
-    "sonnet": "sonnet",
+    "opus": "opus[1m]",
+    "sonnet": "sonnet[1m]",
     "haiku": "haiku",
-    "claude-opus": "opus",
-    "claude-sonnet": "sonnet",
+    "opus200k": "opus",
+    "sonnet200k": "sonnet",
+    "claude-opus": "opus[1m]",
+    "claude-sonnet": "sonnet[1m]",
     "claude-haiku": "haiku",
-    "claude-opus-4": "opus",
-    "claude-sonnet-4": "sonnet",
+    "claude-opus-4": "opus[1m]",
+    "claude-sonnet-4": "sonnet[1m]",
     "claude-haiku-4": "haiku",
-    "cc-executor/opus": "opus",
-    "cc-executor/sonnet": "sonnet",
+    "cc-executor/opus": "opus[1m]",
+    "cc-executor/sonnet": "sonnet[1m]",
     "cc-executor/haiku": "haiku",
+    "cc-executor/opus200k": "opus",
+    "cc-executor/sonnet200k": "sonnet",
 }
 
 AVAILABLE_MODELS = [
     {"id": "opus", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
     {"id": "sonnet", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
     {"id": "haiku", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
+    {"id": "opus200k", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
+    {"id": "sonnet200k", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
     {"id": "cc-executor/opus", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
     {"id": "cc-executor/sonnet", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
     {"id": "cc-executor/haiku", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
+    {"id": "cc-executor/opus200k", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
+    {"id": "cc-executor/sonnet200k", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
 ]
 
 
-def _run_claude(model, prompt, system_prompt=None, max_turns=None, allowed_tools=None):
-    """Run claude CLI and return (ok, output, error)."""
+def _run_claude(cli_model, prompt, system_prompt=None, max_turns=None, allowed_tools=None):
+    """Run claude CLI with a resolved CLI model name (e.g. 'opus[1m]' or 'opus')."""
     cmd = ["claude", "--print", "--setting-sources", ""]
 
-    if model:
-        cmd += ["--model", MODEL_MAP.get(model, model)]
+    if cli_model:
+        cmd += ["--model", cli_model]
     if max_turns:
         cmd += ["--max-turns", str(max_turns)]
     if system_prompt:
@@ -83,6 +95,35 @@ def _run_claude(model, prompt, system_prompt=None, max_turns=None, allowed_tools
         return False, "", "claude CLI not found"
     except Exception as e:
         return False, "", str(e)
+
+
+def _run_claude_with_retry(model, prompt, system_prompt=None, max_turns=None, allowed_tools=None):
+    """Resolve model alias, run once, retry once after a short delay, and
+    fall back from 1M (`foo[1m]`) to the 200K variant (`foo`) if still failing."""
+    resolved = MODEL_MAP.get(model, model)
+
+    ok, output, error = _run_claude(resolved, prompt, system_prompt, max_turns, allowed_tools)
+    if ok:
+        return ok, output, error
+
+    print(
+        f"[RETRY] model={resolved} failed, retrying in {RETRY_DELAY_SECONDS}s: {(error or '')[:200]}",
+        file=sys.stderr,
+    )
+    time.sleep(RETRY_DELAY_SECONDS)
+    ok, output, error = _run_claude(resolved, prompt, system_prompt, max_turns, allowed_tools)
+    if ok:
+        return ok, output, error
+
+    if resolved.endswith("[1m]"):
+        fallback = resolved[:-4]
+        print(
+            f"[FALLBACK] {resolved} → {fallback} after retry failure: {(error or '')[:200]}",
+            file=sys.stderr,
+        )
+        return _run_claude(fallback, prompt, system_prompt, max_turns, allowed_tools)
+
+    return ok, output, error
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -168,7 +209,7 @@ class Handler(BaseHTTPRequestHandler):
 
         prompt = "\n\n".join(user_parts)
 
-        ok, output, error = _run_claude(
+        ok, output, error = _run_claude_with_retry(
             model=model,
             prompt=prompt,
             system_prompt=system_prompt,
