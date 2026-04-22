@@ -86,6 +86,9 @@ For each `POST /v1/chat/completions`:
       variant.
    4. If all three attempts fail, return HTTP 500 with the last error.
 5. **Return** — wrap the CLI stdout in an OpenAI `chat.completion` envelope.
+   If the response came from the fallback path, the CLI stdout is **prefixed
+   with a visible fallback notice** and the JSON envelope carries an extra
+   top-level `fallback` field (see below).
 
 ```
 request ─► [1m] attempt ──ok──► 200 response
@@ -101,6 +104,33 @@ Retry delay is controlled by `RETRY_DELAY_SECONDS` in `server.py` (default: 5).
 Fallback is skipped entirely for models that were already 200K (no `[1m]`
 suffix after resolution), so `haiku`, `opus200k`, and `sonnet200k` just get a
 single retry with no third attempt.
+
+### Fallback notice format
+
+When a fallback happens, the first block of `choices[0].message.content` is a
+bracketed notice, followed by a blank line, then the actual model output:
+
+```
+[Fallback notice: requested opus[1m] but 1M context was unavailable after retry; served with opus (200K context) instead.]
+
+<actual response body>
+```
+
+The JSON envelope also gains a non-standard top-level `fallback` field so
+structured clients can detect it without string-matching:
+
+```json
+{
+  "id": "chatcmpl-…",
+  "object": "chat.completion",
+  "model": "opus",
+  "choices": [{ "index": 0, "message": {"role": "assistant", "content": "[Fallback notice: …]\n\n…"} }],
+  "fallback": { "from": "opus[1m]", "to": "opus" }
+}
+```
+
+Clients that strictly validate against the OpenAI schema will simply ignore
+the extra `fallback` key.
 
 ### Notes on `--setting-sources ""`
 

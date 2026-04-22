@@ -99,12 +99,16 @@ def _run_claude(cli_model, prompt, system_prompt=None, max_turns=None, allowed_t
 
 def _run_claude_with_retry(model, prompt, system_prompt=None, max_turns=None, allowed_tools=None):
     """Resolve model alias, run once, retry once after a short delay, and
-    fall back from 1M (`foo[1m]`) to the 200K variant (`foo`) if still failing."""
+    fall back from 1M (`foo[1m]`) to the 200K variant (`foo`) if still failing.
+
+    Returns (ok, output, error, fallback_info) where fallback_info is either
+    None or a dict {"from": "<1m model>", "to": "<200k model>"}.
+    """
     resolved = MODEL_MAP.get(model, model)
 
     ok, output, error = _run_claude(resolved, prompt, system_prompt, max_turns, allowed_tools)
     if ok:
-        return ok, output, error
+        return ok, output, error, None
 
     print(
         f"[RETRY] model={resolved} failed, retrying in {RETRY_DELAY_SECONDS}s: {(error or '')[:200]}",
@@ -113,7 +117,7 @@ def _run_claude_with_retry(model, prompt, system_prompt=None, max_turns=None, al
     time.sleep(RETRY_DELAY_SECONDS)
     ok, output, error = _run_claude(resolved, prompt, system_prompt, max_turns, allowed_tools)
     if ok:
-        return ok, output, error
+        return ok, output, error, None
 
     if resolved.endswith("[1m]"):
         fallback = resolved[:-4]
@@ -121,9 +125,11 @@ def _run_claude_with_retry(model, prompt, system_prompt=None, max_turns=None, al
             f"[FALLBACK] {resolved} → {fallback} after retry failure: {(error or '')[:200]}",
             file=sys.stderr,
         )
-        return _run_claude(fallback, prompt, system_prompt, max_turns, allowed_tools)
+        ok, output, error = _run_claude(fallback, prompt, system_prompt, max_turns, allowed_tools)
+        fallback_info = {"from": resolved, "to": fallback} if ok else None
+        return ok, output, error, fallback_info
 
-    return ok, output, error
+    return ok, output, error, None
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -209,7 +215,7 @@ class Handler(BaseHTTPRequestHandler):
 
         prompt = "\n\n".join(user_parts)
 
-        ok, output, error = _run_claude_with_retry(
+        ok, output, error, fallback_info = _run_claude_with_retry(
             model=model,
             prompt=prompt,
             system_prompt=system_prompt,
@@ -224,6 +230,16 @@ class Handler(BaseHTTPRequestHandler):
                 "error": {"message": err_msg, "type": "server_error"}
             })
             return
+
+        # On successful fallback, prepend a visible notice so the caller
+        # knows the response came from the 200K model, not the requested 1M.
+        if fallback_info:
+            notice = (
+                f"[Fallback notice: requested {fallback_info['from']} but 1M "
+                f"context was unavailable after retry; served with "
+                f"{fallback_info['to']} (200K context) instead.]\n\n"
+            )
+            output = notice + output
 
         response = {
             "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
@@ -241,6 +257,8 @@ class Handler(BaseHTTPRequestHandler):
                 "total_tokens": 0,
             },
         }
+        if fallback_info:
+            response["fallback"] = fallback_info
         self._json_response(200, response)
 
     # ── Response helper ──
