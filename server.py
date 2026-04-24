@@ -28,6 +28,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from pathlib import Path
 
 HOST = os.environ.get("CC_EXECUTOR_HOST", "0.0.0.0")
 PORT = int(os.environ.get("CC_EXECUTOR_PORT", "9100"))
@@ -73,9 +74,27 @@ AVAILABLE_MODELS = [
 ]
 
 
+def _cleanup_session_file(session_id):
+    """Delete the jsonl that Claude Code wrote for this one-shot call.
+
+    Claude Code persists every conversation (including --print runs) to
+    ~/.claude/projects/<hyphenated-cwd>/<session_id>.jsonl. For an HTTP
+    executor that's pure waste — the file is never resumed. We remove it
+    immediately after the subprocess finishes so the volume does not
+    grow unbounded across retries/fallbacks.
+    """
+    project_name = WORKDIR.replace("/", "-")
+    path = Path.home() / ".claude" / "projects" / project_name / f"{session_id}.jsonl"
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def _run_claude(cli_model, prompt, system_prompt=None, max_turns=None, allowed_tools=None):
     """Run claude CLI with a resolved CLI model name (e.g. 'opus[1m]' or 'opus')."""
-    cmd = ["claude", "--print", "--setting-sources", ""]
+    session_id = str(uuid.uuid4())
+    cmd = ["claude", "--print", "--setting-sources", "", "--session-id", session_id]
 
     if cli_model:
         cmd += ["--model", cli_model]
@@ -89,27 +108,30 @@ def _run_claude(cli_model, prompt, system_prompt=None, max_turns=None, allowed_t
 
     print(f"[DEBUG] cmd={' '.join(cmd)}", file=sys.stderr)
     try:
-        result = subprocess.run(
-            cmd,
-            input=prompt,
-            capture_output=True,
-            text=True,
-            timeout=TIMEOUT,
-            cwd=WORKDIR,
-        )
-        if result.returncode == 0:
-            return True, result.stdout.strip(), None
-        else:
-            print(f"[ERROR] returncode={result.returncode}", file=sys.stderr)
-            print(f"[ERROR] stderr={result.stderr.strip()[:500]}", file=sys.stderr)
-            print(f"[ERROR] stdout={result.stdout.strip()[:200]}", file=sys.stderr)
-            return False, result.stdout.strip(), result.stderr.strip()
-    except subprocess.TimeoutExpired:
-        return False, "", "timeout"
-    except FileNotFoundError:
-        return False, "", "claude CLI not found"
-    except Exception as e:
-        return False, "", str(e)
+        try:
+            result = subprocess.run(
+                cmd,
+                input=prompt,
+                capture_output=True,
+                text=True,
+                timeout=TIMEOUT,
+                cwd=WORKDIR,
+            )
+            if result.returncode == 0:
+                return True, result.stdout.strip(), None
+            else:
+                print(f"[ERROR] returncode={result.returncode}", file=sys.stderr)
+                print(f"[ERROR] stderr={result.stderr.strip()[:500]}", file=sys.stderr)
+                print(f"[ERROR] stdout={result.stdout.strip()[:200]}", file=sys.stderr)
+                return False, result.stdout.strip(), result.stderr.strip()
+        except subprocess.TimeoutExpired:
+            return False, "", "timeout"
+        except FileNotFoundError:
+            return False, "", "claude CLI not found"
+        except Exception as e:
+            return False, "", str(e)
+    finally:
+        _cleanup_session_file(session_id)
 
 
 def _run_claude_with_retry(model, prompt, system_prompt=None, max_turns=None, allowed_tools=None):
