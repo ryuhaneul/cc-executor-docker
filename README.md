@@ -77,23 +77,36 @@ curl http://localhost:9100/v1/chat/completions \
 
 ## Models
 
-Bare aliases (`opus`, `sonnet`) resolve to the standard **200K-context** CLI
-model. To request **1M context**, opt in explicitly with the `[1m]` suffix
-(`opus[1m]`, `sonnet[1m]`).
+`opus` aliases default to the **1M-context** variant. `sonnet` aliases default
+to the standard **200K** variant — to use 1M Sonnet, request `sonnet[1m]`
+explicitly. The `[1m]` suffix on any name maps to the 1M CLI model verbatim.
 
 | Model ID | CLI Model | Context |
 |----------|-----------|---------|
-| `opus[1m]` | `opus[1m]` | 1M |
-| `sonnet[1m]` | `sonnet[1m]` | 1M |
-| `opus` | `opus` | 200K |
-| `sonnet` | `sonnet` | 200K |
+| `opus[1m]` | `opus[1m]` | 1M (explicit) |
+| `claude-opus[1m]` | `opus[1m]` | 1M (explicit) |
+| `cc-executor/opus[1m]` | `opus[1m]` | 1M (explicit) |
+| `sonnet[1m]` | `sonnet[1m]` | 1M (explicit) |
+| `claude-sonnet[1m]` | `sonnet[1m]` | 1M (explicit) |
+| `cc-executor/sonnet[1m]` | `sonnet[1m]` | 1M (explicit) |
+| `opus` | `opus[1m]` | 1M (default) |
+| `claude-opus` | `opus[1m]` | 1M (default) |
+| `claude-opus-4` | `opus[1m]` | 1M (default) |
+| `cc-executor/opus` | `opus[1m]` | 1M (default) |
+| `sonnet` | `sonnet` | 200K (default) |
+| `claude-sonnet` | `sonnet` | 200K (default) |
+| `claude-sonnet-4` | `sonnet` | 200K (default) |
+| `cc-executor/sonnet` | `sonnet` | 200K (default) |
 | `haiku` | `haiku` | 200K (1M not supported) |
-| `opus200k` | `opus` | 200K (alias of `opus`) |
+| `claude-haiku` | `haiku` | 200K (1M not supported) |
+| `claude-haiku-4` | `haiku` | 200K (1M not supported) |
+| `cc-executor/haiku` | `haiku` | 200K (1M not supported) |
+| `opus200k` | `opus` | 200K (force 200K) |
+| `cc-executor/opus200k` | `opus` | 200K (force 200K) |
 | `sonnet200k` | `sonnet` | 200K (alias of `sonnet`) |
+| `cc-executor/sonnet200k` | `sonnet` | 200K (alias of `sonnet`) |
 
-Aliases like `claude-opus-4`, `claude-sonnet`, and the `cc-executor/<model>`
-provider-style names also work, including `cc-executor/opus[1m]` and
-`cc-executor/sonnet[1m]` for 1M context (see `MODEL_MAP` in `server.py`).
+See `MODEL_MAP` in `server.py` for the source of truth.
 
 > **Note on 1M access** — 1M context for Opus is included on the Max plan.
 > Sonnet 1M availability depends on account state (see Anthropic docs). If a
@@ -122,8 +135,7 @@ its own `claude --print` subprocess. A slow request no longer blocks other
 callers. Per-request `--session-id` (UUID v4) keeps the per-call jsonl files
 isolated from each other.
 
-Non-streaming only. Each individual request still blocks until the CLI
-completes; concurrency means **across requests**, not within a single one.
+Non-streaming only.
 
 ### Request Flow
 

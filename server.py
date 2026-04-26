@@ -39,33 +39,36 @@ WORKDIR = "/app/workdir"
 RETRY_DELAY_SECONDS = 5
 
 # Model name mapping: OpenAI-style names → Claude Code CLI model names.
-# Bare names (`opus`, `sonnet`) map to the standard 200K-context CLI model.
-# To request 1M context, use the explicit `[1m]` suffix (`opus[1m]`,
-# `sonnet[1m]`). 1M context is included on the Max plan for Opus; Sonnet
-# availability depends on the account.
+# `opus` aliases default to the 1M-context variant (`opus[1m]`, included on
+# Max plan). `sonnet` aliases default to the standard 200K variant — request
+# 1M Sonnet explicitly via `sonnet[1m]`. The `[1m]` suffix on any name maps
+# to the 1M CLI model verbatim. Use `*200k` to force 200K explicitly.
 MODEL_MAP = {
-    # 1M context — explicit opt-in via `[1m]` suffix
+    # 1M context — explicit suffix
     "opus[1m]": "opus[1m]",
     "sonnet[1m]": "sonnet[1m]",
     "claude-opus[1m]": "opus[1m]",
     "claude-sonnet[1m]": "sonnet[1m]",
     "cc-executor/opus[1m]": "opus[1m]",
     "cc-executor/sonnet[1m]": "sonnet[1m]",
-    # 200K context — default for bare model names
-    "opus": "opus",
+    # opus bare aliases → 1M (default)
+    "opus": "opus[1m]",
+    "claude-opus": "opus[1m]",
+    "claude-opus-4": "opus[1m]",
+    "cc-executor/opus": "opus[1m]",
+    # sonnet bare aliases → 200K (default)
     "sonnet": "sonnet",
+    "claude-sonnet": "sonnet",
+    "claude-sonnet-4": "sonnet",
+    "cc-executor/sonnet": "sonnet",
+    # haiku (1M not supported)
     "haiku": "haiku",
+    "claude-haiku": "haiku",
+    "claude-haiku-4": "haiku",
+    "cc-executor/haiku": "haiku",
+    # explicit 200K opt-out for opus/sonnet
     "opus200k": "opus",
     "sonnet200k": "sonnet",
-    "claude-opus": "opus",
-    "claude-sonnet": "sonnet",
-    "claude-haiku": "haiku",
-    "claude-opus-4": "opus",
-    "claude-sonnet-4": "sonnet",
-    "claude-haiku-4": "haiku",
-    "cc-executor/opus": "opus",
-    "cc-executor/sonnet": "sonnet",
-    "cc-executor/haiku": "haiku",
     "cc-executor/opus200k": "opus",
     "cc-executor/sonnet200k": "sonnet",
 }
