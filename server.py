@@ -27,7 +27,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 
 HOST = os.environ.get("CC_EXECUTOR_HOST", "0.0.0.0")
@@ -39,33 +39,47 @@ WORKDIR = "/app/workdir"
 RETRY_DELAY_SECONDS = 5
 
 # Model name mapping: OpenAI-style names → Claude Code CLI model names.
-# Default aliases point at 1M context via the `[1m]` suffix (included on Max
-# plan for Opus; Sonnet depends on account). Use *200k variants to opt out.
+# Bare names (`opus`, `sonnet`) map to the standard 200K-context CLI model.
+# To request 1M context, use the explicit `[1m]` suffix (`opus[1m]`,
+# `sonnet[1m]`). 1M context is included on the Max plan for Opus; Sonnet
+# availability depends on the account.
 MODEL_MAP = {
-    "opus": "opus[1m]",
-    "sonnet": "sonnet[1m]",
+    # 1M context — explicit opt-in via `[1m]` suffix
+    "opus[1m]": "opus[1m]",
+    "sonnet[1m]": "sonnet[1m]",
+    "claude-opus[1m]": "opus[1m]",
+    "claude-sonnet[1m]": "sonnet[1m]",
+    "cc-executor/opus[1m]": "opus[1m]",
+    "cc-executor/sonnet[1m]": "sonnet[1m]",
+    # 200K context — default for bare model names
+    "opus": "opus",
+    "sonnet": "sonnet",
     "haiku": "haiku",
     "opus200k": "opus",
     "sonnet200k": "sonnet",
-    "claude-opus": "opus[1m]",
-    "claude-sonnet": "sonnet[1m]",
+    "claude-opus": "opus",
+    "claude-sonnet": "sonnet",
     "claude-haiku": "haiku",
-    "claude-opus-4": "opus[1m]",
-    "claude-sonnet-4": "sonnet[1m]",
+    "claude-opus-4": "opus",
+    "claude-sonnet-4": "sonnet",
     "claude-haiku-4": "haiku",
-    "cc-executor/opus": "opus[1m]",
-    "cc-executor/sonnet": "sonnet[1m]",
+    "cc-executor/opus": "opus",
+    "cc-executor/sonnet": "sonnet",
     "cc-executor/haiku": "haiku",
     "cc-executor/opus200k": "opus",
     "cc-executor/sonnet200k": "sonnet",
 }
 
 AVAILABLE_MODELS = [
+    {"id": "opus[1m]", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
+    {"id": "sonnet[1m]", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
     {"id": "opus", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
     {"id": "sonnet", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
     {"id": "haiku", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
     {"id": "opus200k", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
     {"id": "sonnet200k", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
+    {"id": "cc-executor/opus[1m]", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
+    {"id": "cc-executor/sonnet[1m]", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
     {"id": "cc-executor/opus", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
     {"id": "cc-executor/sonnet", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
     {"id": "cc-executor/haiku", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
@@ -610,8 +624,9 @@ def main():
     if not API_KEY:
         print("WARNING: CC_API_KEY is not set. All requests will be rejected.", file=sys.stderr)
 
-    server = HTTPServer((HOST, PORT), Handler)
-    print(f"cc-executor listening on {HOST}:{PORT}", file=sys.stderr)
+    server = ThreadingHTTPServer((HOST, PORT), Handler)
+    server.daemon_threads = True
+    print(f"cc-executor listening on {HOST}:{PORT} (threaded)", file=sys.stderr)
     print(f"  POST /v1/chat/completions", file=sys.stderr)
     print(f"  GET  /v1/models", file=sys.stderr)
     print(f"  GET  /health", file=sys.stderr)

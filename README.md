@@ -77,19 +77,23 @@ curl http://localhost:9100/v1/chat/completions \
 
 ## Models
 
-Default aliases resolve to the **1M-context** variant (`[1m]` suffix). Use the
-`*200k` variants to force the standard 200K window.
+Bare aliases (`opus`, `sonnet`) resolve to the standard **200K-context** CLI
+model. To request **1M context**, opt in explicitly with the `[1m]` suffix
+(`opus[1m]`, `sonnet[1m]`).
 
 | Model ID | CLI Model | Context |
 |----------|-----------|---------|
-| `opus` | `opus[1m]` | 1M |
-| `sonnet` | `sonnet[1m]` | 1M |
+| `opus[1m]` | `opus[1m]` | 1M |
+| `sonnet[1m]` | `sonnet[1m]` | 1M |
+| `opus` | `opus` | 200K |
+| `sonnet` | `sonnet` | 200K |
 | `haiku` | `haiku` | 200K (1M not supported) |
-| `opus200k` | `opus` | 200K |
-| `sonnet200k` | `sonnet` | 200K |
+| `opus200k` | `opus` | 200K (alias of `opus`) |
+| `sonnet200k` | `sonnet` | 200K (alias of `sonnet`) |
 
 Aliases like `claude-opus-4`, `claude-sonnet`, and the `cc-executor/<model>`
-provider-style names also work (see `MODEL_MAP` in `server.py`).
+provider-style names also work, including `cc-executor/opus[1m]` and
+`cc-executor/sonnet[1m]` for 1M context (see `MODEL_MAP` in `server.py`).
 
 > **Note on 1M access** — 1M context for Opus is included on the Max plan.
 > Sonnet 1M availability depends on account state (see Anthropic docs). If a
@@ -112,7 +116,14 @@ Claude Code login is stored in a named Docker volume (`cc-auth`). Run `bash logi
 
 Each request spawns `claude --print --system-prompt "..." "prompt"` as a subprocess. This uses Claude Code's `--print` mode which passes system prompts directly without SDK agent framework interference — system prompt adherence is reliable.
 
-Non-streaming only. Each request blocks until the CLI completes.
+The HTTP server is a `ThreadingHTTPServer`, so multiple `/v1/chat/completions`
+requests are handled **concurrently** — each in its own thread, each spawning
+its own `claude --print` subprocess. A slow request no longer blocks other
+callers. Per-request `--session-id` (UUID v4) keeps the per-call jsonl files
+isolated from each other.
+
+Non-streaming only. Each individual request still blocks until the CLI
+completes; concurrency means **across requests**, not within a single one.
 
 ### Request Flow
 
