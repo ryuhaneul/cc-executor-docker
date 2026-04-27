@@ -19,6 +19,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import ssl
 import subprocess
 import sys
@@ -91,7 +92,7 @@ AVAILABLE_MODELS = [
 ]
 
 
-def _cleanup_session_file(session_id):
+def _cleanup_session_file(session_id, cwd=None):
     """Delete the jsonl that Claude Code wrote for this one-shot call.
 
     Claude Code persists every conversation (including --print runs) to
@@ -99,16 +100,28 @@ def _cleanup_session_file(session_id):
     executor that's pure waste — the file is never resumed. We remove it
     immediately after the subprocess finishes so the volume does not
     grow unbounded across retries/fallbacks.
+
+    `cwd` controls which project dir we look in (defaults to WORKDIR). For
+    per-request workdirs we also try to rmdir the project dir if empty so
+    ~/.claude/projects/ doesn't accumulate one entry per file-output call.
     """
-    project_name = WORKDIR.replace("/", "-")
-    path = Path.home() / ".claude" / "projects" / project_name / f"{session_id}.jsonl"
+    effective_cwd = cwd or WORKDIR
+    project_name = effective_cwd.replace("/", "-")
+    project_path = Path.home() / ".claude" / "projects" / project_name
+    path = project_path / f"{session_id}.jsonl"
     try:
         path.unlink(missing_ok=True)
     except OSError:
         pass
+    if cwd and cwd != WORKDIR:
+        try:
+            project_path.rmdir()
+        except OSError:
+            pass
 
 
-def _run_claude(cli_model, prompt, system_prompt=None, max_turns=None, allowed_tools=None):
+def _run_claude(cli_model, prompt, system_prompt=None, max_turns=None, allowed_tools=None,
+                cwd=None, dangerously_skip_permissions=False, timeout=None):
     """Run claude CLI with a resolved CLI model name (e.g. 'opus[1m]' or 'opus')."""
     session_id = str(uuid.uuid4())
     cmd = ["claude", "--print", "--setting-sources", "", "--session-id", session_id]
@@ -122,8 +135,14 @@ def _run_claude(cli_model, prompt, system_prompt=None, max_turns=None, allowed_t
     if allowed_tools:
         for tool in allowed_tools:
             cmd += ["--allowedTools", tool]
+    if dangerously_skip_permissions:
+        cmd += ["--dangerously-skip-permissions"]
 
-    print(f"[DEBUG] cmd={' '.join(cmd)}", file=sys.stderr)
+    effective_cwd = cwd or WORKDIR
+    effective_timeout = timeout if timeout is not None else TIMEOUT
+
+    print(f"[DEBUG] cmd={' '.join(cmd)} cwd={effective_cwd} timeout={effective_timeout}",
+          file=sys.stderr)
     try:
         try:
             result = subprocess.run(
@@ -131,8 +150,8 @@ def _run_claude(cli_model, prompt, system_prompt=None, max_turns=None, allowed_t
                 input=prompt,
                 capture_output=True,
                 text=True,
-                timeout=TIMEOUT,
-                cwd=WORKDIR,
+                timeout=effective_timeout,
+                cwd=effective_cwd,
             )
             if result.returncode == 0:
                 return True, result.stdout.strip(), None
@@ -148,10 +167,11 @@ def _run_claude(cli_model, prompt, system_prompt=None, max_turns=None, allowed_t
         except Exception as e:
             return False, "", str(e)
     finally:
-        _cleanup_session_file(session_id)
+        _cleanup_session_file(session_id, cwd=effective_cwd)
 
 
-def _run_claude_with_retry(model, prompt, system_prompt=None, max_turns=None, allowed_tools=None):
+def _run_claude_with_retry(model, prompt, system_prompt=None, max_turns=None, allowed_tools=None,
+                            cwd=None, dangerously_skip_permissions=False, timeout=None):
     """Resolve model alias, run once, retry once after a short delay, and
     fall back from 1M (`foo[1m]`) to the 200K variant (`foo`) if still failing.
 
@@ -159,8 +179,16 @@ def _run_claude_with_retry(model, prompt, system_prompt=None, max_turns=None, al
     None or a dict {"from": "<1m model>", "to": "<200k model>"}.
     """
     resolved = MODEL_MAP.get(model, model)
+    kwargs = dict(
+        system_prompt=system_prompt,
+        max_turns=max_turns,
+        allowed_tools=allowed_tools,
+        cwd=cwd,
+        dangerously_skip_permissions=dangerously_skip_permissions,
+        timeout=timeout,
+    )
 
-    ok, output, error = _run_claude(resolved, prompt, system_prompt, max_turns, allowed_tools)
+    ok, output, error = _run_claude(resolved, prompt, **kwargs)
     if ok:
         return ok, output, error, None
 
@@ -169,7 +197,7 @@ def _run_claude_with_retry(model, prompt, system_prompt=None, max_turns=None, al
         file=sys.stderr,
     )
     time.sleep(RETRY_DELAY_SECONDS)
-    ok, output, error = _run_claude(resolved, prompt, system_prompt, max_turns, allowed_tools)
+    ok, output, error = _run_claude(resolved, prompt, **kwargs)
     if ok:
         return ok, output, error, None
 
@@ -179,11 +207,46 @@ def _run_claude_with_retry(model, prompt, system_prompt=None, max_turns=None, al
             f"[FALLBACK] {resolved} → {fallback} after retry failure: {(error or '')[:200]}",
             file=sys.stderr,
         )
-        ok, output, error = _run_claude(fallback, prompt, system_prompt, max_turns, allowed_tools)
+        ok, output, error = _run_claude(fallback, prompt, **kwargs)
         fallback_info = {"from": resolved, "to": fallback} if ok else None
         return ok, output, error, fallback_info
 
     return ok, output, error, None
+
+
+def _collect_files(request_dir):
+    """Walk request_dir and return {relative_path: content_str}.
+
+    UTF-8 text is returned verbatim; binary or undecodable files are returned
+    as `data:base64,<...>` so the JSON envelope can carry anything the model
+    wrote (images, archives, etc.).
+    """
+    out = {}
+    for root, _, names in os.walk(request_dir):
+        for name in sorted(names):
+            full = os.path.join(root, name)
+            rel = os.path.relpath(full, request_dir)
+            try:
+                with open(full, encoding="utf-8") as fh:
+                    out[rel] = fh.read()
+            except UnicodeDecodeError:
+                try:
+                    with open(full, "rb") as fh:
+                        out[rel] = "data:base64," + base64.b64encode(fh.read()).decode("ascii")
+                except OSError as exc:
+                    out[rel] = f"[read error: {exc}]"
+            except OSError as exc:
+                out[rel] = f"[read error: {exc}]"
+    return out
+
+
+_FILES_MODE_INSTRUCTION = (
+    "OUTPUT MODE: file-output. Write all deliverables as files in the current "
+    "working directory using the Write tool — choose clear filenames (e.g. "
+    "`subtitle.srt`, `songs.json`). Your final text response must be a brief "
+    "summary listing which files you produced and what each contains; do NOT "
+    "inline the deliverable content in the text response."
+)
 
 
 # ─── OAuth 2.0 + PKCE state (in-memory, process-local) ───
@@ -541,6 +604,10 @@ class Handler(BaseHTTPRequestHandler):
 
         messages = body.get("messages", [])
         model = body.get("model", "sonnet")
+        output_files_mode = bool(body.get("output_files", False))
+        max_turns = body.get("max_turns")
+        request_timeout = body.get("timeout")
+        body_allowed_tools = body.get("allowed_tools")
 
         if not messages:
             self._json_response(400, {"error": {"message": "messages is required", "type": "invalid_request_error"}})
@@ -565,51 +632,95 @@ class Handler(BaseHTTPRequestHandler):
 
         prompt = "\n\n".join(user_parts)
 
-        ok, output, error, fallback_info = _run_claude_with_retry(
-            model=model,
-            prompt=prompt,
-            system_prompt=system_prompt,
-        )
+        # Configure run mode. Default = OpenAI-compatible text-only flow.
+        # output_files=True opt-in: per-request workdir, Write/Read/Edit tools
+        # auto-approved, system prompt instructs model to write deliverables
+        # to disk; we glob the dir on completion and embed file contents.
+        request_dir = None
+        cwd = None
+        allowed_tools = body_allowed_tools
+        dangerously_skip = False
 
-        if not ok:
-            err_msg = error or "Generation failed"
-            print(f"[ERROR] model={model} error={err_msg}", file=sys.stderr)
-            if output:
-                print(f"[ERROR] stdout={output[:500]}", file=sys.stderr)
-            self._json_response(500, {
-                "error": {"message": err_msg, "type": "server_error"}
-            })
-            return
-
-        # On successful fallback, prepend a visible notice so the caller
-        # knows the response came from the 200K model, not the requested 1M.
-        if fallback_info:
-            notice = (
-                f"[Fallback notice: requested {fallback_info['from']} but 1M "
-                f"context was unavailable after retry; served with "
-                f"{fallback_info['to']} (200K context) instead.]\n\n"
+        if output_files_mode:
+            request_id = uuid.uuid4().hex[:12]
+            request_dir = os.path.join(WORKDIR, f"req-{request_id}")
+            try:
+                os.makedirs(request_dir, exist_ok=True)
+            except OSError as exc:
+                self._json_response(500, {"error": {"message": f"workdir create failed: {exc}", "type": "server_error"}})
+                return
+            cwd = request_dir
+            dangerously_skip = True
+            if not allowed_tools:
+                allowed_tools = ["Write", "Read", "Edit"]
+            if max_turns is None:
+                max_turns = 50
+            system_prompt = (
+                _FILES_MODE_INSTRUCTION + ("\n\n" + system_prompt if system_prompt else "")
             )
-            output = notice + output
 
-        response = {
-            "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": model,
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": output},
-                "finish_reason": "stop",
-            }],
-            "usage": {
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "total_tokens": 0,
-            },
-        }
-        if fallback_info:
-            response["fallback"] = fallback_info
-        self._json_response(200, response)
+        try:
+            ok, output, error, fallback_info = _run_claude_with_retry(
+                model=model,
+                prompt=prompt,
+                system_prompt=system_prompt,
+                max_turns=max_turns,
+                allowed_tools=allowed_tools,
+                cwd=cwd,
+                dangerously_skip_permissions=dangerously_skip,
+                timeout=request_timeout,
+            )
+
+            if not ok:
+                err_msg = error or "Generation failed"
+                print(f"[ERROR] model={model} error={err_msg}", file=sys.stderr)
+                if output:
+                    print(f"[ERROR] stdout={output[:500]}", file=sys.stderr)
+                self._json_response(500, {
+                    "error": {"message": err_msg, "type": "server_error"}
+                })
+                return
+
+            # On successful fallback, prepend a visible notice so the caller
+            # knows the response came from the 200K model, not the requested 1M.
+            if fallback_info:
+                notice = (
+                    f"[Fallback notice: requested {fallback_info['from']} but 1M "
+                    f"context was unavailable after retry; served with "
+                    f"{fallback_info['to']} (200K context) instead.]\n\n"
+                )
+                output = notice + output
+
+            files_payload = _collect_files(request_dir) if output_files_mode else None
+
+            response = {
+                "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": output},
+                    "finish_reason": "stop",
+                }],
+                "usage": {
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                },
+            }
+            if fallback_info:
+                response["fallback"] = fallback_info
+            if files_payload is not None:
+                response["files"] = files_payload
+            self._json_response(200, response)
+        finally:
+            if request_dir:
+                try:
+                    shutil.rmtree(request_dir)
+                except OSError as exc:
+                    print(f"[WARN] failed to clean request dir {request_dir}: {exc}",
+                          file=sys.stderr)
 
     # ── Response helper ──
 

@@ -200,6 +200,92 @@ structured clients can detect it without string-matching:
 Clients that strictly validate against the OpenAI schema will simply ignore
 the extra `fallback` key.
 
+### File-output mode (`output_files: true`)
+
+For workloads where the deliverable is **larger than a single Claude response
+can hold** (e.g. cleaning up a 900K-token YouTube transcript whose output also
+runs into the millions of tokens), the standard chat envelope is too small —
+one response is capped at the model's per-turn output limit (~64K tokens).
+
+Opt in by adding `"output_files": true` to the request body. The server then:
+
+1. Creates a per-request scratch directory `/app/workdir/req-<uuid>/` inside
+   the container.
+2. Invokes the CLI with `--allowedTools Write Read Edit
+   --dangerously-skip-permissions --max-turns N` and **prepends a system-prompt
+   instruction** telling the model to write deliverables as files via the
+   `Write` tool, leaving only a brief summary in its text response.
+3. Runs the CLI with `cwd=<request_dir>`, so the agent's working directory is
+   the scratch dir.
+4. After the CLI finishes, walks the scratch dir, embeds every file into the
+   response under a top-level `files` object (`{relative/path: contents}`),
+   and **deletes the scratch dir**. UTF-8 text files are inlined verbatim;
+   binary or undecodable files are returned as `data:base64,<…>`.
+
+The standard `choices[0].message.content` still carries the model's text reply
+(usually a one-paragraph summary of which files it wrote).
+
+Optional body fields that pair with this mode:
+
+| Field | Default | Notes |
+|-------|---------|-------|
+| `output_files` | `false` | Set `true` to enable file-output mode. |
+| `max_turns` | `50` (in files mode) / unset (text mode) | Caps the agent's tool-call iterations. Each Write call is one turn, so for ~1M-token output you typically need 20+ turns. |
+| `timeout` | `CC_TIMEOUT` (default `300`) | Per-request CLI timeout (seconds). Long-running file-output jobs usually need 1200–1800. |
+| `allowed_tools` | `["Write", "Read", "Edit"]` (in files mode) | Override the default tool whitelist. |
+
+Example — clean a YouTube subtitle file and detect song segments:
+
+```bash
+curl http://localhost:9100/v1/chat/completions \
+  -H "Authorization: Bearer $CC_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d @- <<'JSON'
+{
+  "model": "opus[1m]",
+  "output_files": true,
+  "max_turns": 60,
+  "timeout": 1800,
+  "messages": [
+    {"role": "system", "content": "You are a subtitle post-processor."},
+    {"role": "user", "content": "Clean up this auto-generated subtitle file (smooth phrasing, fix punctuation, keep timestamps) and ALSO detect any music sections, listing the song info you can identify.\n\nProduce two files:\n - subtitle.srt — the cleaned-up SRT\n - songs.json — array of {start, end, title, artist} for detected songs.\n\nRaw transcript follows:\n\n<...900K tokens of raw subtitles...>"}
+  ]
+}
+JSON
+```
+
+Response shape:
+
+```json
+{
+  "id": "chatcmpl-…",
+  "object": "chat.completion",
+  "model": "opus[1m]",
+  "choices": [{ "index": 0, "message": { "role": "assistant", "content": "Wrote subtitle.srt (cleaned-up SRT, 12,432 cues) and songs.json (3 detected songs)." }, "finish_reason": "stop" }],
+  "files": {
+    "subtitle.srt": "1\n00:00:00,000 --> 00:00:03,200\n...",
+    "songs.json": "[{\"start\":\"00:14:22\",\"end\":\"00:18:05\",\"title\":\"…\",\"artist\":\"…\"},…]"
+  }
+}
+```
+
+Caveats:
+
+- **Output token ceiling per turn still applies.** Claude's max output per
+  assistant turn is ~64K tokens, so to produce >64K of file content the model
+  must call `Write` multiple times (one chunk per turn). Set `max_turns`
+  generously — for ~1M tokens of output, 20–30 turns is realistic.
+- **Context window is per the resolved model.** 900K-token inputs require an
+  `opus[1m]` (or `sonnet[1m]`) request. Bare `sonnet`/`haiku` will reject the
+  oversized prompt before the agent runs.
+- **Response size scales with deliverable size.** A 1M-token output ≈ 4–8 MB
+  of JSON. Make sure your client and any reverse proxy (Nginx
+  `client_max_body_size`, `proxy_read_timeout`, etc.) can handle it.
+- **Sandbox.** Tools run inside the Docker container with
+  `--dangerously-skip-permissions`; the scratch dir is deleted on every call,
+  but the CLI itself has full POSIX access while the request is in flight.
+  Consider this when authoring prompts that include untrusted text.
+
 ### Notes on `--setting-sources ""`
 
 The CLI is invoked with `--setting-sources ""` which disables loading of
