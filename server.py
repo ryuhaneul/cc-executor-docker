@@ -121,7 +121,7 @@ def _cleanup_session_file(session_id, cwd=None):
 
 
 def _run_claude(cli_model, prompt, system_prompt=None, max_turns=None, allowed_tools=None,
-                cwd=None, dangerously_skip_permissions=False, timeout=None):
+                cwd=None, dangerously_skip_permissions=False, timeout=None, add_dirs=None):
     """Run claude CLI with a resolved CLI model name (e.g. 'opus[1m]' or 'opus')."""
     session_id = str(uuid.uuid4())
     cmd = ["claude", "--print", "--setting-sources", "", "--session-id", session_id]
@@ -135,8 +135,15 @@ def _run_claude(cli_model, prompt, system_prompt=None, max_turns=None, allowed_t
     if allowed_tools:
         for tool in allowed_tools:
             cmd += ["--allowedTools", tool]
+    if add_dirs:
+        for d in add_dirs:
+            cmd += ["--add-dir", d]
     if dangerously_skip_permissions:
-        cmd += ["--dangerously-skip-permissions"]
+        # Two distinct flags. `--allow-dangerously-skip-permissions` enables
+        # the option (gated off by default in the CLI); the second flag then
+        # actually applies it. Passing only the second is a no-op on builds
+        # where the gate is enforced.
+        cmd += ["--allow-dangerously-skip-permissions", "--dangerously-skip-permissions"]
 
     effective_cwd = cwd or WORKDIR
     effective_timeout = timeout if timeout is not None else TIMEOUT
@@ -171,7 +178,8 @@ def _run_claude(cli_model, prompt, system_prompt=None, max_turns=None, allowed_t
 
 
 def _run_claude_with_retry(model, prompt, system_prompt=None, max_turns=None, allowed_tools=None,
-                            cwd=None, dangerously_skip_permissions=False, timeout=None):
+                            cwd=None, dangerously_skip_permissions=False, timeout=None,
+                            add_dirs=None):
     """Resolve model alias, run once, retry once after a short delay, and
     fall back from 1M (`foo[1m]`) to the 200K variant (`foo`) if still failing.
 
@@ -186,6 +194,7 @@ def _run_claude_with_retry(model, prompt, system_prompt=None, max_turns=None, al
         cwd=cwd,
         dangerously_skip_permissions=dangerously_skip_permissions,
         timeout=timeout,
+        add_dirs=add_dirs,
     )
 
     ok, output, error = _run_claude(resolved, prompt, **kwargs)
@@ -608,6 +617,8 @@ class Handler(BaseHTTPRequestHandler):
         max_turns = body.get("max_turns")
         request_timeout = body.get("timeout")
         body_allowed_tools = body.get("allowed_tools")
+        body_cwd = body.get("cwd")
+        body_add_dirs = body.get("add_dirs") or []
 
         if not messages:
             self._json_response(400, {"error": {"message": "messages is required", "type": "invalid_request_error"}})
@@ -632,14 +643,23 @@ class Handler(BaseHTTPRequestHandler):
 
         prompt = "\n\n".join(user_parts)
 
-        # Configure run mode. Default = OpenAI-compatible text-only flow.
-        # output_files=True opt-in: per-request workdir, Write/Read/Edit tools
-        # auto-approved, system prompt instructs model to write deliverables
-        # to disk; we glob the dir on completion and embed file contents.
+        # Three modes:
+        #   1. text-only (default)            — no tools, OpenAI-compatible.
+        #   2. file-output (output_files)     — per-request scratch dir, files
+        #                                       returned in JSON, scratch wiped.
+        #   3. direct-filesystem (cwd/add_dirs) — caller-managed paths (e.g. a
+        #                                         bind-mounted /storage/jobs/<id>);
+        #                                         no scratch, no JSON files, no
+        #                                         cleanup. Caller owns I/O.
         request_dir = None
         cwd = None
+        add_dirs = body_add_dirs or None
         allowed_tools = body_allowed_tools
         dangerously_skip = False
+
+        direct_fs_mode = (not output_files_mode) and bool(
+            body_cwd or body_add_dirs or body_allowed_tools
+        )
 
         if output_files_mode:
             request_id = uuid.uuid4().hex[:12]
@@ -658,6 +678,15 @@ class Handler(BaseHTTPRequestHandler):
             system_prompt = (
                 _FILES_MODE_INSTRUCTION + ("\n\n" + system_prompt if system_prompt else "")
             )
+            # body_add_dirs still respected so the agent can read auxiliary
+            # mounted paths even while writing deliverables to the scratch dir.
+        elif direct_fs_mode:
+            cwd = body_cwd  # may be None — _run_claude falls back to WORKDIR
+            dangerously_skip = True
+            if not allowed_tools:
+                allowed_tools = ["Read", "Write", "Edit"]
+            if max_turns is None:
+                max_turns = 50
 
         try:
             ok, output, error, fallback_info = _run_claude_with_retry(
@@ -669,6 +698,7 @@ class Handler(BaseHTTPRequestHandler):
                 cwd=cwd,
                 dangerously_skip_permissions=dangerously_skip,
                 timeout=request_timeout,
+                add_dirs=add_dirs,
             )
 
             if not ok:

@@ -200,41 +200,61 @@ structured clients can detect it without string-matching:
 Clients that strictly validate against the OpenAI schema will simply ignore
 the extra `fallback` key.
 
-### File-output mode (`output_files: true`)
+### Tool-enabled modes
 
-For workloads where the deliverable is **larger than a single Claude response
-can hold** (e.g. cleaning up a 900K-token YouTube transcript whose output also
-runs into the millions of tokens), the standard chat envelope is too small —
-one response is capped at the model's per-turn output limit (~64K tokens).
+By default, `/v1/chat/completions` is text-only — no tools, single-shot prompt
+in / model text out. For workloads where one Claude response is too small
+(e.g. cleaning up a 900K-token YouTube transcript whose output runs into the
+millions of tokens), there are two opt-in tool-enabled modes:
 
-Opt in by adding `"output_files": true` to the request body. The server then:
+- **File-output mode (`output_files: true`)** — the proxy creates a per-request
+  scratch dir, the agent writes deliverables there, and the dir is read back
+  into the JSON response and then wiped. Use this when the **caller has only
+  HTTP access** (no shared filesystem) and wants the bytes back inline.
+- **Direct-filesystem mode (`cwd` / `add_dirs`)** — the caller supplies one or
+  more bind-mounted directories, and the agent reads/writes inside them
+  directly. The proxy never reads the files itself, never includes them in
+  the JSON response, and never deletes them. Use this when the caller and
+  cc-executor share a volume (e.g. a sibling service on the same Docker host).
 
-1. Creates a per-request scratch directory `/app/workdir/req-<uuid>/` inside
-   the container.
-2. Invokes the CLI with `--allowedTools Write Read Edit
-   --dangerously-skip-permissions --max-turns N` and **prepends a system-prompt
-   instruction** telling the model to write deliverables as files via the
-   `Write` tool, leaving only a brief summary in its text response.
-3. Runs the CLI with `cwd=<request_dir>`, so the agent's working directory is
-   the scratch dir.
-4. After the CLI finishes, walks the scratch dir, embeds every file into the
-   response under a top-level `files` object (`{relative/path: contents}`),
-   and **deletes the scratch dir**. UTF-8 text files are inlined verbatim;
-   binary or undecodable files are returned as `data:base64,<…>`.
+#### How tools are unlocked
 
-The standard `choices[0].message.content` still carries the model's text reply
-(usually a one-paragraph summary of which files it wrote).
+Both tool-enabled modes pass the following flags to `claude --print`:
 
-Optional body fields that pair with this mode:
+| Flag | Why |
+|------|-----|
+| `--allow-dangerously-skip-permissions` | Enables the bypass option (the CLI ships with this option gated off). |
+| `--dangerously-skip-permissions` | Actually applies the bypass — needed because `--print` is non-interactive, so any tool call requiring approval would otherwise hang or fail. |
+| `--allowedTools <tool>` (repeated) | Whitelists the tools the agent may invoke. Defaults to `Read Write Edit` (no `Bash`); override via the `allowed_tools` body field. |
+| `--add-dir <path>` (repeated) | Per `add_dirs` body field — extra paths the agent may access on top of `cwd`. |
+| `--max-turns N` | Caps tool iterations. Each `Write` call is one turn, so a multi-megabyte deliverable typically needs 20–60 turns. |
 
-| Field | Default | Notes |
-|-------|---------|-------|
-| `output_files` | `false` | Set `true` to enable file-output mode. |
-| `max_turns` | `50` (in files mode) / unset (text mode) | Caps the agent's tool-call iterations. Each Write call is one turn, so for ~1M-token output you typically need 20+ turns. |
-| `timeout` | `CC_TIMEOUT` (default `300`) | Per-request CLI timeout (seconds). Long-running file-output jobs usually need 1200–1800. |
-| `allowed_tools` | `["Write", "Read", "Edit"]` (in files mode) | Override the default tool whitelist. |
+Both `--allow-dangerously-skip-permissions` and `--dangerously-skip-permissions`
+are required — the first alone only unlocks the option, and the second alone
+is a no-op on builds where the gate is enforced.
 
-Example — clean a YouTube subtitle file and detect song segments:
+#### Body fields (all modes)
+
+| Field | Default | Applies to | Notes |
+|-------|---------|-----------|-------|
+| `output_files` | `false` | — | `true` enables file-output mode. |
+| `cwd` | `/app/workdir` | direct-fs | Working directory for the CLI. Set to a bind-mounted path you control (e.g. `/storage/jobs/<id>`). |
+| `add_dirs` | `[]` | direct-fs / file-output | Extra directories the agent may access (passed as repeated `--add-dir`). |
+| `allowed_tools` | `["Read","Write","Edit"]` (tool modes) | tool modes | Override the default whitelist. To allow shell access, include `"Bash"` — see security caveat below. |
+| `max_turns` | `50` (tool modes) / unset (text mode) | all | Cap on tool-call iterations. |
+| `timeout` | `CC_TIMEOUT` (default `300`) | all | Per-request CLI timeout in seconds. Long jobs usually need 1200–1800. |
+
+Mode is selected automatically:
+
+- `output_files: true` → file-output mode (scratch dir + JSON `files`).
+- `output_files` absent/false **and** any of `cwd` / `add_dirs` / `allowed_tools`
+  is set → direct-filesystem mode (no scratch, no JSON `files`).
+- Otherwise → text-only.
+
+#### File-output mode — example (HTTP-only caller)
+
+Clean a YouTube subtitle file and detect song segments, with the deliverables
+returned in the JSON response:
 
 ```bash
 curl http://localhost:9100/v1/chat/completions \
@@ -254,6 +274,12 @@ curl http://localhost:9100/v1/chat/completions \
 JSON
 ```
 
+The server creates `/app/workdir/req-<uuid>/` inside the container, prepends a
+system-prompt instruction telling the model to write deliverables via `Write`
+and only summarize in its text response, runs the CLI with `cwd=<request_dir>`,
+then walks the dir into the response and `rmtree`s it. UTF-8 files are inlined
+verbatim; binary/undecodable files come back as `data:base64,<…>`.
+
 Response shape:
 
 ```json
@@ -269,22 +295,82 @@ Response shape:
 }
 ```
 
-Caveats:
+#### Direct-filesystem mode — example (shared-volume caller)
+
+When the caller and cc-executor share a bind-mounted volume (e.g. cc-executor
+runs alongside another service on the same Docker host and both mount
+`./data/jobs:/storage/jobs`), the caller can point the agent at a per-job
+directory and let it read input files / write outputs directly — no JSON file
+payload, no scratch dir, no auto-deletion:
+
+```bash
+curl http://cc-executor:9100/v1/chat/completions \
+  -H "Authorization: Bearer $CC_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d @- <<'JSON'
+{
+  "model": "opus[1m]",
+  "cwd": "/storage/jobs/job-abc123",
+  "allowed_tools": ["Read", "Write", "Edit"],
+  "max_turns": 60,
+  "timeout": 1800,
+  "messages": [
+    {"role": "user", "content": "Read raw.srt in time-ordered chunks (use the Read tool's offset/limit). For each chunk, append cleaned subtitles to clean.srt and any detected song segments to songs.json. Do not load the whole transcript into context at once."}
+  ]
+}
+JSON
+```
+
+Response is just a text summary — the deliverables stay on the shared volume
+where the caller can pick them up:
+
+```json
+{
+  "id": "chatcmpl-…",
+  "object": "chat.completion",
+  "model": "opus[1m]",
+  "choices": [{ "index": 0, "message": { "role": "assistant", "content": "Processed raw.srt in 12 chunks. Wrote clean.srt (12,401 cues) and songs.json (3 song segments) into /storage/jobs/job-abc123/." }, "finish_reason": "stop" }]
+}
+```
+
+To bind-mount the path, add it to the cc-executor service in your Compose
+file:
+
+```yaml
+services:
+  cc-executor:
+    build:
+      context: "https://github.com/ryuhaneul/cc-executor-docker.git#main"
+    volumes:
+      - cc-auth:/root/.claude
+      - ./data/jobs:/storage/jobs:rw   # ← shared with the calling service
+```
+
+The `cwd` value (`/storage/jobs/job-abc123`) is the path **inside the
+cc-executor container**, not the host path.
+
+#### Caveats (both tool-enabled modes)
 
 - **Output token ceiling per turn still applies.** Claude's max output per
   assistant turn is ~64K tokens, so to produce >64K of file content the model
   must call `Write` multiple times (one chunk per turn). Set `max_turns`
-  generously — for ~1M tokens of output, 20–30 turns is realistic.
+  generously — for ~1M tokens of output, 20–60 turns is realistic.
 - **Context window is per the resolved model.** 900K-token inputs require an
   `opus[1m]` (or `sonnet[1m]`) request. Bare `sonnet`/`haiku` will reject the
-  oversized prompt before the agent runs.
-- **Response size scales with deliverable size.** A 1M-token output ≈ 4–8 MB
-  of JSON. Make sure your client and any reverse proxy (Nginx
-  `client_max_body_size`, `proxy_read_timeout`, etc.) can handle it.
-- **Sandbox.** Tools run inside the Docker container with
-  `--dangerously-skip-permissions`; the scratch dir is deleted on every call,
-  but the CLI itself has full POSIX access while the request is in flight.
-  Consider this when authoring prompts that include untrusted text.
+  oversized prompt before the agent runs. For inputs that exceed even 1M,
+  use direct-filesystem mode and instruct the model to `Read` the source
+  file in offset/limit chunks so the full text is never resident in context.
+- **Response size scales with deliverable size (file-output only).** A 1M-token
+  output ≈ 4–8 MB of JSON. Make sure your client and any reverse proxy (Nginx
+  `client_max_body_size`, `proxy_read_timeout`, etc.) can handle it. Direct-
+  filesystem mode sidesteps this — the response is just the text summary.
+- **Sandbox / blast radius.** With `--dangerously-skip-permissions` the agent
+  can use any whitelisted tool with no further approval. Keep `allowed_tools`
+  scoped (the default `Read Write Edit` excludes `Bash`), and in
+  direct-filesystem mode mount **only the directory the job needs** — not the
+  whole jobs root — so a prompt-injected agent can't reach unrelated jobs.
+- **No auto-cleanup in direct-filesystem mode.** The proxy never deletes
+  files in `cwd` or `add_dirs`. The caller owns the lifecycle of those paths.
 
 ### Notes on `--setting-sources ""`
 
