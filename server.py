@@ -670,7 +670,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._json_response(500, {"error": {"message": f"workdir create failed: {exc}", "type": "server_error"}})
                 return
             cwd = request_dir
-            dangerously_skip = True
+            # Claude CLI refuses --dangerously-skip-permissions when running as
+            # root (security check). The container runs as root for OAuth token
+            # access at /root/.claude. Rely on --allowedTools auto-approval.
+            dangerously_skip = False
             if not allowed_tools:
                 allowed_tools = ["Write", "Read", "Edit"]
             if max_turns is None:
@@ -682,7 +685,8 @@ class Handler(BaseHTTPRequestHandler):
             # mounted paths even while writing deliverables to the scratch dir.
         elif direct_fs_mode:
             cwd = body_cwd  # may be None — _run_claude falls back to WORKDIR
-            dangerously_skip = True
+            # Same root-vs-skip-permissions guard as above.
+            dangerously_skip = False
             if not allowed_tools:
                 allowed_tools = ["Read", "Write", "Edit"]
             if max_turns is None:
