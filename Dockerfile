@@ -6,7 +6,7 @@ RUN npm install -g @anthropic-ai/claude-code && \
     update-ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-RUN mkdir -p /root/.claude && \
+RUN mkdir -p /root/.claude/users && \
     ln -sf /root/.claude/.claude.json /root/.claude.json
 
 WORKDIR /app

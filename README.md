@@ -125,6 +125,19 @@ See `MODEL_MAP` in `server.py` for the source of truth.
 
 Claude Code login is stored in a named Docker volume (`cc-auth`). Run `bash login.sh` once after first deploy. The session persists across container restarts.
 
+### Per-caller credential isolation (optional)
+
+By default every request uses the shared config dir `/root/.claude`. A caller may
+isolate credentials per user by sending an `X-Claude-Config-Dir` header (or a
+`claude_config_dir` body field) pointing at a subdirectory under
+`/root/.claude/users/`, e.g. `/root/.claude/users/alice`. The server validates
+the path with `realpath` and rejects anything outside `/root/.claude/users/`
+(or the default `/root/.claude`) with HTTP 400, so callers cannot escape the
+config root. When the header is absent, behaviour is unchanged — this is a
+backward-compatible opt-in. The header applies to every endpoint: OAuth
+start/complete, `/admin/credentials`, `/admin/status`, `/admin/logout`, and
+`/v1/chat/completions`.
+
 ## How It Works
 
 Each request spawns `claude --print --system-prompt "..." "prompt"` as a subprocess. This uses Claude Code's `--print` mode which passes system prompts directly without SDK agent framework interference — system prompt adherence is reliable.

@@ -36,6 +36,8 @@ PORT = int(os.environ.get("CC_EXECUTOR_PORT", "9100"))
 API_KEY = os.environ.get("CC_API_KEY", "")
 TIMEOUT = int(os.environ.get("CC_TIMEOUT", "300"))
 WORKDIR = "/app/workdir"
+DEFAULT_CLAUDE_CONFIG_DIR = "/root/.claude"
+USER_CLAUDE_CONFIG_ROOT = "/root/.claude/users"
 
 RETRY_DELAY_SECONDS = 5
 
@@ -92,7 +94,27 @@ AVAILABLE_MODELS = [
 ]
 
 
-def _cleanup_session_file(session_id, cwd=None):
+def _valid_claude_config_dir(path):
+    if not path:
+        return DEFAULT_CLAUDE_CONFIG_DIR
+    real = os.path.realpath(path)
+    root = os.path.realpath(USER_CLAUDE_CONFIG_ROOT)
+    if real == DEFAULT_CLAUDE_CONFIG_DIR or real.startswith(root + os.sep):
+        return real
+    return None
+
+
+def _claude_env(claude_config_dir=None):
+    config_dir = _valid_claude_config_dir(claude_config_dir)
+    if not config_dir:
+        raise ValueError("invalid CLAUDE_CONFIG_DIR")
+    os.makedirs(config_dir, exist_ok=True)
+    env = os.environ.copy()
+    env["CLAUDE_CONFIG_DIR"] = config_dir
+    return env, config_dir
+
+
+def _cleanup_session_file(session_id, cwd=None, claude_config_dir=None):
     """Delete the jsonl that Claude Code wrote for this one-shot call.
 
     Claude Code persists every conversation (including --print runs) to
@@ -107,7 +129,8 @@ def _cleanup_session_file(session_id, cwd=None):
     """
     effective_cwd = cwd or WORKDIR
     project_name = effective_cwd.replace("/", "-")
-    project_path = Path.home() / ".claude" / "projects" / project_name
+    config_dir = _valid_claude_config_dir(claude_config_dir) or DEFAULT_CLAUDE_CONFIG_DIR
+    project_path = Path(config_dir) / "projects" / project_name
     path = project_path / f"{session_id}.jsonl"
     try:
         path.unlink(missing_ok=True)
@@ -121,7 +144,8 @@ def _cleanup_session_file(session_id, cwd=None):
 
 
 def _run_claude(cli_model, prompt, system_prompt=None, max_turns=None, allowed_tools=None,
-                cwd=None, dangerously_skip_permissions=False, timeout=None, add_dirs=None):
+                cwd=None, dangerously_skip_permissions=False, timeout=None, add_dirs=None,
+                claude_config_dir=None):
     """Run claude CLI with a resolved CLI model name (e.g. 'opus[1m]' or 'opus')."""
     session_id = str(uuid.uuid4())
     cmd = ["claude", "--print", "--setting-sources", "", "--session-id", session_id]
@@ -147,6 +171,10 @@ def _run_claude(cli_model, prompt, system_prompt=None, max_turns=None, allowed_t
 
     effective_cwd = cwd or WORKDIR
     effective_timeout = timeout if timeout is not None else TIMEOUT
+    try:
+        env, effective_config_dir = _claude_env(claude_config_dir)
+    except ValueError as exc:
+        return False, "", str(exc)
 
     print(f"[DEBUG] cmd={' '.join(cmd)} cwd={effective_cwd} timeout={effective_timeout}",
           file=sys.stderr)
@@ -159,6 +187,7 @@ def _run_claude(cli_model, prompt, system_prompt=None, max_turns=None, allowed_t
                 text=True,
                 timeout=effective_timeout,
                 cwd=effective_cwd,
+                env=env,
             )
             if result.returncode == 0:
                 return True, result.stdout.strip(), None
@@ -174,12 +203,12 @@ def _run_claude(cli_model, prompt, system_prompt=None, max_turns=None, allowed_t
         except Exception as e:
             return False, "", str(e)
     finally:
-        _cleanup_session_file(session_id, cwd=effective_cwd)
+        _cleanup_session_file(session_id, cwd=effective_cwd, claude_config_dir=effective_config_dir)
 
 
 def _run_claude_with_retry(model, prompt, system_prompt=None, max_turns=None, allowed_tools=None,
                             cwd=None, dangerously_skip_permissions=False, timeout=None,
-                            add_dirs=None):
+                            add_dirs=None, claude_config_dir=None):
     """Resolve model alias, run once, retry once after a short delay, and
     fall back from 1M (`foo[1m]`) to the 200K variant (`foo`) if still failing.
 
@@ -195,6 +224,7 @@ def _run_claude_with_retry(model, prompt, system_prompt=None, max_turns=None, al
         dangerously_skip_permissions=dangerously_skip_permissions,
         timeout=timeout,
         add_dirs=add_dirs,
+        claude_config_dir=claude_config_dir,
     )
 
     ok, output, error = _run_claude(resolved, prompt, **kwargs)
@@ -348,10 +378,12 @@ def _exchange_code_for_token(code, code_verifier, state):
         return 0, {"error": {"message": f"network: {exc}"}}
 
 
-def _write_credentials(creds: dict) -> tuple[bool, str]:
-    """Atomically write to /root/.claude/.credentials.json (0600)."""
-    claude_dir = "/root/.claude"
-    os.makedirs(claude_dir, exist_ok=True)
+def _write_credentials(creds: dict, claude_config_dir=None) -> tuple[bool, str]:
+    """Atomically write .credentials.json in the selected Claude config dir."""
+    try:
+        _, claude_dir = _claude_env(claude_config_dir)
+    except ValueError as exc:
+        return False, str(exc)
     target = os.path.join(claude_dir, ".credentials.json")
     tmp = target + ".tmp"
     try:
@@ -371,12 +403,13 @@ def _write_credentials(creds: dict) -> tuple[bool, str]:
         return False, str(exc)
 
 
-def _claude_auth_status():
+def _claude_auth_status(claude_config_dir=None):
     """Return dict parsed from `claude auth status` JSON, or {}."""
     try:
+        env, _ = _claude_env(claude_config_dir)
         out = subprocess.run(
             ["claude", "auth", "status"],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=10, env=env,
         )
         m = re.search(r"\{.*?\}", out.stdout, re.DOTALL)
         if m:
@@ -403,6 +436,16 @@ class Handler(BaseHTTPRequestHandler):
             return True
         return False
 
+    def _claude_config_dir_from_request(self, body=None):
+        requested = self.headers.get("X-Claude-Config-Dir", "")
+        if not requested and isinstance(body, dict):
+            requested = body.get("claude_config_dir") or ""
+        config_dir = _valid_claude_config_dir(requested)
+        if not config_dir:
+            self._json_response(400, {"error": {"message": "invalid CLAUDE_CONFIG_DIR"}})
+            return None
+        return config_dir
+
     # ── GET ──
 
     def do_GET(self):
@@ -417,7 +460,10 @@ class Handler(BaseHTTPRequestHandler):
             if not self._check_auth():
                 self._json_response(401, {"error": {"message": "Invalid API key"}})
                 return
-            status = _claude_auth_status()
+            config_dir = self._claude_config_dir_from_request()
+            if not config_dir:
+                return
+            status = _claude_auth_status(config_dir)
             self._json_response(200, {
                 "loggedIn": bool(status.get("loggedIn")),
                 "authMethod": status.get("authMethod"),
@@ -451,6 +497,9 @@ class Handler(BaseHTTPRequestHandler):
             self._json_response(401, {"error": {"message": "Invalid API key"}})
             return
         body = self._read_json() or {}
+        config_dir = self._claude_config_dir_from_request(body)
+        if not config_dir:
+            return
         creds = body.get("credentials")
         if not isinstance(creds, dict):
             self._json_response(422, {"error": {"message": "credentials must be an object"}})
@@ -459,11 +508,11 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(oauth, dict) or not oauth.get("accessToken"):
             self._json_response(422, {"error": {"message": "credentials.claudeAiOauth.accessToken missing"}})
             return
-        ok, err = _write_credentials(creds)
+        ok, err = _write_credentials(creds, config_dir)
         if not ok:
             self._json_response(500, {"error": {"message": f"write failed: {err}"}})
             return
-        status = _claude_auth_status()
+        status = _claude_auth_status(config_dir)
         self._json_response(200, {
             "ok": bool(status.get("loggedIn")),
             "loggedIn": bool(status.get("loggedIn")),
@@ -479,6 +528,9 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_oauth_start(self):
         if not self._check_auth():
             self._json_response(401, {"error": {"message": "Invalid API key"}})
+            return
+        config_dir = self._claude_config_dir_from_request()
+        if not config_dir:
             return
         _reap_oauth_sessions()
 
@@ -516,6 +568,9 @@ class Handler(BaseHTTPRequestHandler):
             self._json_response(401, {"error": {"message": "Invalid API key"}})
             return
         body = self._read_json() or {}
+        config_dir = self._claude_config_dir_from_request(body)
+        if not config_dir:
+            return
         sid = body.get("session_id")
         if not sid:
             self._json_response(422, {"error": {"message": "session_id is required"}})
@@ -563,12 +618,12 @@ class Handler(BaseHTTPRequestHandler):
                 "isMax": True,
             }
         }
-        ok, err = _write_credentials(creds)
+        ok, err = _write_credentials(creds, config_dir)
         if not ok:
             self._json_response(500, {"ok": False, "error": {"message": f"write failed: {err}"}})
             return
 
-        final = _claude_auth_status()
+        final = _claude_auth_status(config_dir)
         self._json_response(200, {
             "ok": True,
             "loggedIn": bool(final.get("loggedIn")),
@@ -584,9 +639,13 @@ class Handler(BaseHTTPRequestHandler):
             self._json_response(401, {"error": {"message": "Invalid API key"}})
             return
         try:
+            config_dir = self._claude_config_dir_from_request()
+            if not config_dir:
+                return
+            env, _ = _claude_env(config_dir)
             out = subprocess.run(
                 ["claude", "auth", "logout"],
-                capture_output=True, text=True, timeout=10,
+                capture_output=True, text=True, timeout=10, env=env,
             )
             self._json_response(200, {"ok": out.returncode == 0, "stdout": out.stdout[-400:]})
         except Exception as exc:
@@ -609,6 +668,9 @@ class Handler(BaseHTTPRequestHandler):
         body = self._read_json()
         if body is None:
             self._json_response(400, {"error": {"message": "Invalid JSON", "type": "invalid_request_error"}})
+            return
+        config_dir = self._claude_config_dir_from_request(body)
+        if not config_dir:
             return
 
         messages = body.get("messages", [])
@@ -703,6 +765,7 @@ class Handler(BaseHTTPRequestHandler):
                 dangerously_skip_permissions=dangerously_skip,
                 timeout=request_timeout,
                 add_dirs=add_dirs,
+                claude_config_dir=config_dir,
             )
 
             if not ok:
