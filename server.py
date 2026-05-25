@@ -108,6 +108,11 @@ def _valid_claude_config_dir(path):
 def _valid_delete_config_dir(path):
     if not path:
         return None
+    # normpath drops trailing separators / "." segments so a directory
+    # symlink given as "users/link/" is still caught by islink (which
+    # returns False on a trailing slash). normpath does NOT resolve
+    # symlinks, so the lstat-based islink check below stays meaningful.
+    path = os.path.normpath(path)
     if os.path.islink(path):
         return None
     real = os.path.realpath(path)
