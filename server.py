@@ -11,6 +11,7 @@ Admin (Bearer-protected):
   POST /admin/oauth/complete      — exchange code, save .credentials.json
   POST /admin/credentials         — paste .credentials.json manually
   POST /admin/logout              — claude auth logout
+  DELETE /admin/config-dir        — purge one per-user local config dir
 """
 
 import base64
@@ -102,6 +103,25 @@ def _valid_claude_config_dir(path):
     if real == DEFAULT_CLAUDE_CONFIG_DIR or real.startswith(root + os.sep):
         return real
     return None
+
+
+def _valid_delete_config_dir(path):
+    if not path:
+        return None
+    if os.path.islink(path):
+        return None
+    real = os.path.realpath(path)
+    root = os.path.realpath(USER_CLAUDE_CONFIG_ROOT)
+    default = os.path.realpath(DEFAULT_CLAUDE_CONFIG_DIR)
+    if real == root or real == default:
+        return None
+    if not real.startswith(root + os.sep):
+        return None
+    if os.path.dirname(real) != root:
+        return None
+    if os.path.basename(real) == "":
+        return None
+    return real
 
 
 def _claude_env(claude_config_dir=None):
@@ -487,6 +507,34 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_logout()
         else:
             self.send_error(404)
+
+    # ── DELETE ──
+
+    def do_DELETE(self):
+        if self.path == "/admin/config-dir":
+            self._handle_delete_config_dir()
+        else:
+            self.send_error(404)
+
+    # ── /admin/config-dir ──
+
+    def _handle_delete_config_dir(self):
+        if not self._check_auth():
+            self._json_response(401, {"error": {"message": "Invalid API key"}})
+            return
+        requested = self.headers.get("X-Claude-Config-Dir", "")
+        config_dir = _valid_delete_config_dir(requested)
+        if config_dir is None:
+            self._json_response(400, {"error": {"message": "invalid config dir for delete"}})
+            return
+        if not os.path.exists(config_dir):
+            self._json_response(200, {"ok": True, "existed": False})
+            return
+        try:
+            shutil.rmtree(config_dir)
+            self._json_response(200, {"ok": True, "existed": True})
+        except Exception as exc:
+            self._json_response(500, {"error": {"message": str(exc)}})
 
     # ── /admin/credentials ──
     # Manual fallback: paste the contents of an existing .credentials.json

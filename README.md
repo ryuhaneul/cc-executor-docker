@@ -14,6 +14,7 @@ OpenAI-compatible API proxy for Claude Code CLI. Wraps `claude --print` in a Doc
 | POST | `/admin/oauth/complete` | Bearer | Body `{session_id, code}`. Exchanges the code against Anthropic's token endpoint and writes the bundle to `/root/.claude/.credentials.json` (0600). |
 | POST | `/admin/credentials` | Bearer | Manual fallback. Body `{credentials: {claudeAiOauth: {...}}}` — writes the bundle verbatim. Use when a valid `.credentials.json` already exists (e.g. produced by `claude auth login` on another machine). |
 | POST | `/admin/logout` | Bearer | Run `claude auth logout` |
+| DELETE | `/admin/config-dir` | Bearer | Delete one per-user local config directory selected by `X-Claude-Config-Dir`. This purges local credential/state files only; it does not revoke the remote Anthropic token. |
 
 ### How to authenticate
 
@@ -137,6 +138,15 @@ config root. When the header is absent, behaviour is unchanged — this is a
 backward-compatible opt-in. The header applies to every endpoint: OAuth
 start/complete, `/admin/credentials`, `/admin/status`, `/admin/logout`, and
 `/v1/chat/completions`.
+
+To purge a user's local slot after account deletion, send
+`DELETE /admin/config-dir` with `X-Claude-Config-Dir:
+/root/.claude/users/<user_id>`. The delete endpoint only accepts direct
+children of `/root/.claude/users/`; it rejects the shared default config dir,
+the users root itself, nested paths, symlinks, and paths outside the users
+root. Missing directories return `{ok: true, existed: false}` so callers can
+treat cleanup as idempotent. This is a local credential/state purge only and
+does not revoke the remote Anthropic token.
 
 ## How It Works
 
