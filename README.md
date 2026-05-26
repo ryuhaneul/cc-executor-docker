@@ -202,6 +202,7 @@ rejected when `provider` is `claude`.
 | `CODEX_API_KEY` | unset | Optional Codex/OpenAI API key fallback. When set, it is passed to Codex as both `CODEX_API_KEY` and `OPENAI_API_KEY`. |
 | `CODEX_DEFAULT_MODEL` | `gpt-5.2-codex` | CLI model used by `model: "codex/default"`. |
 | `CC_CODEX_ALLOW_DANGER_FULL_ACCESS` | `false` | Enables `codex_sandbox: "danger-full-access"` only when set to `true`. |
+| `CC_CODEX_REQUIRE_USER_AUTH` | `false` | When `true`, disables shared `CODEX_API_KEY` fallback for Codex status and generation. Use `true` for web deployments with per-user ChatGPT login. |
 
 ## Authentication
 
@@ -215,6 +216,8 @@ may use CLI-prepared auth or `CODEX_API_KEY`. If you need access-token auth, do 
 Instead, call `/admin/codex/credentials` with an access token or imported
 `auth_json` so `/root/.codex/auth.json` exists in the `codex-auth` volume.
 See `docs/web-login-integration.md` for the Claude + Codex web-login endpoints.
+Set `CC_CODEX_REQUIRE_USER_AUTH=true` in web deployments so a shared
+`CODEX_API_KEY` cannot make every per-user Codex slot appear logged in.
 
 ### Per-caller credential isolation (optional)
 

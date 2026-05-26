@@ -63,6 +63,9 @@ Claude per-user isolation:
   `/root/.codex/users/`.
 - `CODEX_API_KEY` can be used for fallback/testing and is passed to Codex as
   both `CODEX_API_KEY` and `OPENAI_API_KEY` when present.
+- `CC_CODEX_REQUIRE_USER_AUTH=true` disables that shared API-key fallback for
+  status and generation; web deployments should enable it so each user must
+  have auth state in their selected `CODEX_HOME`.
 - `CODEX_ACCESS_TOKEN` is intentionally not consumed from environment variables.
 
 ## Codex Web Login Endpoints

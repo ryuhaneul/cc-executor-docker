@@ -55,6 +55,10 @@ CODEX_ALLOW_DANGER_FULL_ACCESS = (
     os.environ.get("CC_CODEX_ALLOW_DANGER_FULL_ACCESS", "false").lower()
     in {"1", "true", "yes", "on"}
 )
+CODEX_REQUIRE_USER_AUTH = (
+    os.environ.get("CC_CODEX_REQUIRE_USER_AUTH", "false").lower()
+    in {"1", "true", "yes", "on"}
+)
 CODEX_ENV_PASSTHROUGH = (
     "PATH",
     "HOME",
@@ -241,7 +245,7 @@ def _codex_env(codex_config_dir=None):
     }
     env["CODEX_HOME"] = config_dir
     codex_api_key = os.environ.get("CODEX_API_KEY")
-    if codex_api_key:
+    if codex_api_key and not CODEX_REQUIRE_USER_AUTH:
         env["CODEX_API_KEY"] = codex_api_key
         env["OPENAI_API_KEY"] = codex_api_key
     return env, config_dir
@@ -573,8 +577,9 @@ _OAUTH_SESSIONS = {}  # id -> {state, code_verifier, created_at}
 _OAUTH_TTL = 600
 
 _CODEX_LOGIN_SESSIONS = {}
+_CODEX_LOGIN_SESSIONS_LOCK = threading.Lock()
 _CODEX_LOGIN_TTL = 900
-_CODEX_LOGIN_URL = "https://auth.openai.com/codex/device"
+_CODEX_LOGIN_URL_RE = re.compile(r"https://auth\.openai\.com/codex/device[^\s]*")
 _CODEX_USER_CODE_RE = re.compile(r"\b[A-Z0-9]{4}-[A-Z0-9]{5}\b")
 _ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
@@ -584,8 +589,11 @@ def _strip_ansi(text):
 
 
 def _parse_codex_device_login_output(text):
+    # Fixture shape observed from Codex 0.133.0: ANSI text containing
+    # https://auth.openai.com/codex/device and MZHT-0HT0G.
     clean = _strip_ansi(text)
-    url = _CODEX_LOGIN_URL if _CODEX_LOGIN_URL in clean else None
+    url_match = _CODEX_LOGIN_URL_RE.search(clean)
+    url = url_match.group(0) if url_match else None
     m = _CODEX_USER_CODE_RE.search(clean)
     user_code = m.group(0) if m else None
     return url, user_code
@@ -605,7 +613,8 @@ def _terminate_proc(proc, timeout=1):
 
 
 def _drain_codex_login_output(session_id):
-    sess = _CODEX_LOGIN_SESSIONS.get(session_id)
+    with _CODEX_LOGIN_SESSIONS_LOCK:
+        sess = _CODEX_LOGIN_SESSIONS.get(session_id)
     if not sess:
         return
     proc = sess["proc"]
@@ -631,8 +640,14 @@ def _drain_codex_login_output(session_id):
                 sess["status"] = "exited"
 
 
+def _get_codex_login_session(session_id):
+    with _CODEX_LOGIN_SESSIONS_LOCK:
+        return _CODEX_LOGIN_SESSIONS.get(session_id)
+
+
 def _pop_codex_login_session(session_id, kill_proc=True):
-    sess = _CODEX_LOGIN_SESSIONS.pop(session_id, None)
+    with _CODEX_LOGIN_SESSIONS_LOCK:
+        sess = _CODEX_LOGIN_SESSIONS.pop(session_id, None)
     if sess and kill_proc:
         with sess["lock"]:
             sess["status"] = "cancelled"
@@ -641,21 +656,37 @@ def _pop_codex_login_session(session_id, kill_proc=True):
 
 
 def _cancel_codex_login_sessions_for_home(codex_home):
-    for sid, sess in list(_CODEX_LOGIN_SESSIONS.items()):
-        if sess.get("codex_home") == codex_home:
-            _pop_codex_login_session(sid, kill_proc=True)
+    with _CODEX_LOGIN_SESSIONS_LOCK:
+        session_ids = [
+            sid for sid, sess in _CODEX_LOGIN_SESSIONS.items()
+            if sess.get("codex_home") == codex_home
+        ]
+    for sid in session_ids:
+        _pop_codex_login_session(sid, kill_proc=True)
 
 
 def _reap_codex_login_sessions():
     now = time.time()
-    for sid, sess in list(_CODEX_LOGIN_SESSIONS.items()):
-        if now - sess["created_at"] > _CODEX_LOGIN_TTL:
-            _pop_codex_login_session(sid, kill_proc=True)
+    with _CODEX_LOGIN_SESSIONS_LOCK:
+        expired = [
+            sid for sid, sess in _CODEX_LOGIN_SESSIONS.items()
+            if now - sess["created_at"] > _CODEX_LOGIN_TTL
+        ]
+    for sid in expired:
+        _pop_codex_login_session(sid, kill_proc=True)
 
 
 def _kill_all_codex_login_sessions():
-    for sid in list(_CODEX_LOGIN_SESSIONS.keys()):
+    with _CODEX_LOGIN_SESSIONS_LOCK:
+        session_ids = list(_CODEX_LOGIN_SESSIONS.keys())
+    for sid in session_ids:
         _pop_codex_login_session(sid, kill_proc=True)
+
+
+def _codex_login_reaper_loop():
+    while True:
+        time.sleep(30)
+        _reap_codex_login_sessions()
 
 
 atexit.register(_kill_all_codex_login_sessions)
@@ -788,6 +819,39 @@ def _codex_login_status(codex_config_dir=None, timeout=10):
         return False
 
 
+def _codex_auth_json_logged_in(config_dir, timeout=10):
+    auth_json = os.path.join(config_dir, "auth.json")
+    return os.path.exists(auth_json) and _codex_login_status(config_dir, timeout=timeout)
+
+
+def _write_codex_auth_json(config_dir, auth_json):
+    target = os.path.join(config_dir, "auth.json")
+    tmp = os.path.join(config_dir, f".auth.json.{uuid.uuid4().hex}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = None
+    try:
+        os.makedirs(config_dir, exist_ok=True)
+        fd = os.open(tmp, flags, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fd = None
+            json.dump(auth_json, fh, ensure_ascii=False)
+        os.replace(tmp, target)
+        return True
+    except Exception:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+        try:
+            os.unlink(tmp)
+        except Exception:
+            pass
+        return False
+
+
 class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
@@ -859,14 +923,13 @@ class Handler(BaseHTTPRequestHandler):
             if not config_dir:
                 return
             cli_available = _codex_cli_available()
-            has_api_key = bool(os.environ.get("CODEX_API_KEY"))
-            auth_json = os.path.join(config_dir, "auth.json")
+            has_api_key = bool(os.environ.get("CODEX_API_KEY")) and not CODEX_REQUIRE_USER_AUTH
             auth_method = None
             logged_in = False
             if has_api_key:
                 auth_method = "api_key"
                 logged_in = True
-            elif os.path.exists(auth_json) and _codex_login_status(config_dir):
+            elif _codex_auth_json_logged_in(config_dir):
                 auth_method = "auth_json"
                 logged_in = True
             self._json_response(200, {
@@ -991,7 +1054,8 @@ class Handler(BaseHTTPRequestHandler):
             "user_code": None,
             "lock": threading.Lock(),
         }
-        _CODEX_LOGIN_SESSIONS[session_id] = sess
+        with _CODEX_LOGIN_SESSIONS_LOCK:
+            _CODEX_LOGIN_SESSIONS[session_id] = sess
         threading.Thread(
             target=_drain_codex_login_output,
             args=(session_id,),
@@ -1031,7 +1095,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json_response(422, {"error": {"message": "session_id is required"}})
             return
         _reap_codex_login_sessions()
-        sess = _CODEX_LOGIN_SESSIONS.get(sid)
+        sess = _get_codex_login_session(sid)
         if not sess:
             self._json_response(404, {"error": {"message": "login session expired or unknown"}})
             return
@@ -1096,22 +1160,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if isinstance(auth_json, dict):
-            target = os.path.join(config_dir, "auth.json")
-            tmp = target + ".tmp"
-            try:
-                os.makedirs(config_dir, exist_ok=True)
-                with open(tmp, "w", encoding="utf-8") as fh:
-                    json.dump(auth_json, fh, ensure_ascii=False)
-                try:
-                    os.chmod(tmp, 0o600)
-                except Exception:
-                    pass
-                os.replace(tmp, target)
-            except Exception:
-                try:
-                    os.unlink(tmp)
-                except Exception:
-                    pass
+            if not _write_codex_auth_json(config_dir, auth_json):
                 self._json_response(500, {"error": {"message": "codex auth_json write failed"}})
                 return
             self._json_response(200, {
@@ -1143,7 +1192,8 @@ class Handler(BaseHTTPRequestHandler):
             )
         except Exception:
             pass
-        for name in ("auth.json",):
+        # Observed Codex local auth state: auth.json plus log/codex-login.log.
+        for name in ("auth.json", os.path.join("log", "codex-login.log")):
             try:
                 os.unlink(os.path.join(config_dir, name))
             except FileNotFoundError:
@@ -1526,6 +1576,15 @@ class Handler(BaseHTTPRequestHandler):
         config_dir = self._codex_config_dir_from_request(body)
         if not config_dir:
             return
+        if CODEX_REQUIRE_USER_AUTH and not _codex_auth_json_logged_in(config_dir, timeout=3):
+            self._json_response(403, {
+                "error": {
+                    "message": "CODEX_AUTH_REQUIRED",
+                    "type": "authentication_error",
+                    "code": "CODEX_AUTH_REQUIRED",
+                }
+            })
+            return
 
         requested_sandbox = body.get("codex_sandbox")
         if requested_sandbox is not None:
@@ -1638,6 +1697,8 @@ def main():
 
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     server.daemon_threads = True
+    reaper = threading.Thread(target=_codex_login_reaper_loop, daemon=True)
+    reaper.start()
     print(f"cc-executor listening on {HOST}:{PORT} (threaded)", file=sys.stderr)
     print(f"  POST /v1/chat/completions", file=sys.stderr)
     print(f"  GET  /v1/models", file=sys.stderr)
