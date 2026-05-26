@@ -686,7 +686,10 @@ def _kill_all_codex_login_sessions():
 def _codex_login_reaper_loop():
     while True:
         time.sleep(30)
-        _reap_codex_login_sessions()
+        try:
+            _reap_codex_login_sessions()
+        except Exception as exc:
+            print(f"[WARN] codex login reaper failed: {exc}", file=sys.stderr)
 
 
 atexit.register(_kill_all_codex_login_sessions)
@@ -887,6 +890,9 @@ class Handler(BaseHTTPRequestHandler):
         if not config_dir:
             self._json_response(400, {"error": {"message": "invalid CODEX_HOME"}})
             return None
+        if CODEX_REQUIRE_USER_AUTH and config_dir == os.path.realpath(DEFAULT_CODEX_CONFIG_DIR):
+            self._json_response(400, {"error": {"message": "CODEX_USER_CONFIG_DIR_REQUIRED"}})
+            return None
         return config_dir
 
     # ── GET ──
@@ -1002,6 +1008,11 @@ class Handler(BaseHTTPRequestHandler):
             self._json_response(401, {"error": {"message": "Invalid API key"}})
             return
         requested = self.headers.get("X-Codex-Config-Dir", "")
+        if CODEX_REQUIRE_USER_AUTH:
+            selected = _valid_codex_config_dir(requested)
+            if selected == os.path.realpath(DEFAULT_CODEX_CONFIG_DIR):
+                self._json_response(400, {"error": {"message": "CODEX_USER_CONFIG_DIR_REQUIRED"}})
+                return
         config_dir = _valid_codex_delete_config_dir(requested)
         if config_dir is None:
             self._json_response(400, {"error": {"message": "invalid codex config dir for delete"}})
