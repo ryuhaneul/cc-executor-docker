@@ -11,7 +11,7 @@ services:
       - CODEX_API_KEY=${CODEX_API_KEY:-}
       - CC_CODEX_ALLOW_DANGER_FULL_ACCESS=${CC_CODEX_ALLOW_DANGER_FULL_ACCESS:-false}
       - CC_CODEX_REQUIRE_USER_AUTH=${CC_CODEX_REQUIRE_USER_AUTH:-false}
-      - CODEX_DEFAULT_MODEL=${CODEX_DEFAULT_MODEL:-gpt-5.2-codex}
+      - CODEX_DEFAULT_MODEL=${CODEX_DEFAULT_MODEL:-gpt-5.5}
     volumes:
       - cc-auth:/root/.claude
       - codex-auth:/root/.codex
