@@ -201,8 +201,32 @@ rejected when `provider` is `claude`.
 | `CC_TIMEOUT` | `300` | CLI execution timeout (seconds) |
 | `CODEX_API_KEY` | unset | Optional Codex/OpenAI API key fallback. When set, it is passed to Codex as both `CODEX_API_KEY` and `OPENAI_API_KEY`. |
 | `CODEX_DEFAULT_MODEL` | `gpt-5.2-codex` | CLI model used by `model: "codex/default"`. |
-| `CC_CODEX_ALLOW_DANGER_FULL_ACCESS` | `false` | Enables `codex_sandbox: "danger-full-access"` only when set to `true`. |
+| `CC_CODEX_ALLOW_DANGER_FULL_ACCESS` | `false` | Enables `codex_sandbox: "danger-full-access"` only when set to `true`. **See the security note below before enabling.** |
 | `CC_CODEX_REQUIRE_USER_AUTH` | `false` | When `true`, disables shared `CODEX_API_KEY` fallback for Codex status and generation. Use `true` for web deployments with per-user ChatGPT login. |
+
+## Security note — Codex `danger-full-access`
+
+Codex file/`cwd` work needs a writable sandbox, but Codex's bubblewrap sandbox
+requires **unprivileged user namespaces**, which are blocked in many Docker
+hosts (`bwrap: Creating new namespace failed: Operation not permitted`, even
+with `seccomp=unconfined`). The only working alternative there is
+`codex_sandbox: "danger-full-access"` (sandbox bypass).
+
+`danger-full-access` runs Codex with **no sandbox** — it can read/write/execute
+**anywhere in the container**. Unlike Claude Code (which is constrained by a
+per-call `--allowedTools` allowlist, so it can be limited to e.g. `Write`
+without `Read`/`Bash`), Codex has **no per-tool allowlist** — its only isolation
+is the OS sandbox.
+
+Therefore enable `CC_CODEX_ALLOW_DANGER_FULL_ACCESS=true` **only in a
+single-trusted-user, externally-sandboxed deployment**. In a multi-user
+container (shared `/root/.codex/users`, `/root/.claude/users`, job storage), a
+prompt injection (e.g. via subtitles/lyrics passed to Codex) could make Codex
+read another user's tokens and exfiltrate them. For multi-user / public use,
+run Codex file work in a **per-user isolated container** (mounting only that
+user's `CODEX_HOME` and job dir) instead — this is the pattern the
+`--dangerously-bypass-approvals-and-sandbox` help text means by "environments
+that are externally sandboxed".
 
 ## Authentication
 
