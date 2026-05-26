@@ -23,6 +23,11 @@ auth or API-key fallback where supported.
 | POST | `/admin/credentials` | Bearer | Manual fallback. Body `{credentials: {claudeAiOauth: {...}}}` — writes the bundle verbatim. Use when a valid `.credentials.json` already exists (e.g. produced by `claude auth login` on another machine). |
 | POST | `/admin/logout` | Bearer | Run `claude auth logout` |
 | DELETE | `/admin/config-dir` | Bearer | Delete one per-user local config directory selected by `X-Claude-Config-Dir`. This purges local credential/state files only; it does not revoke the remote Anthropic token. |
+| POST | `/admin/codex/login/start` | Bearer | Begin Codex device login. Returns `{session_id, url, user_code}`. |
+| POST | `/admin/codex/login/complete` | Bearer | Body `{session_id}`. Polls a pending Codex login and returns `200` when logged in or `202` while pending. |
+| POST | `/admin/codex/credentials` | Bearer | Advanced fallback. Body `{access_token}` or `{auth_json}` for the selected `CODEX_HOME`. |
+| POST | `/admin/codex/logout` | Bearer | Remove local Codex auth state for the selected `CODEX_HOME`. |
+| DELETE | `/admin/codex/config-dir` | Bearer | Delete one per-user Codex config directory selected by `X-Codex-Config-Dir`. |
 
 ### How to authenticate
 
@@ -105,7 +110,18 @@ docker compose up -d --build
 curl http://localhost:9100/admin/codex/status \
   -H "Authorization: Bearer YOUR_API_KEY"
 
-# 4. Test
+# 4. Start browser/device login
+curl -X POST http://localhost:9100/admin/codex/login/start \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "X-Codex-Config-Dir: /root/.codex/users/alice"
+# Open the returned url and enter user_code, then poll:
+curl -X POST http://localhost:9100/admin/codex/login/complete \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "X-Codex-Config-Dir: /root/.codex/users/alice" \
+  -H "Content-Type: application/json" \
+  -d '{"session_id": "SESSION_ID"}'
+
+# 5. Test
 curl http://localhost:9100/v1/chat/completions \
   -H "Authorization: Bearer YOUR_API_KEY" \
   -H "Content-Type: application/json" \
@@ -113,10 +129,9 @@ curl http://localhost:9100/v1/chat/completions \
 ```
 
 For vod-clip web-login implementation details, see
-`docs/web-login-integration.md`. Until those endpoints are implemented, you may
-prepare the `codex-auth` volume with `auth.json` by running
-`codex login --with-access-token` inside the container, then keep
-`CODEX_API_KEY` empty.
+`docs/web-login-integration.md`. Advanced fallback remains available through
+`POST /admin/codex/credentials`; keep `CODEX_API_KEY` empty for per-user
+ChatGPT login flows.
 
 ## Models
 
@@ -193,13 +208,13 @@ rejected when `provider` is `claude`.
 Claude Code login is stored in a named Docker volume (`cc-auth`). Run `bash login.sh` once after first deploy. The session persists across container restarts.
 
 Codex auth is stored separately in the `codex-auth` named volume mounted at
-`/root/.codex`. Web applications can add a browser-login flow on top of this
-storage model; headless deployments may use CLI-prepared auth or
-`CODEX_API_KEY`. If you need access-token auth, do not set
+`/root/.codex`. Web applications can use `/admin/codex/login/start` and
+`/admin/codex/login/complete` for ChatGPT device login; headless deployments
+may use CLI-prepared auth or `CODEX_API_KEY`. If you need access-token auth, do not set
 `CODEX_ACCESS_TOKEN` in `.env`; this proxy does not consume it directly.
-Instead, run `codex login --with-access-token` so `/root/.codex/auth.json`
-exists in the `codex-auth` volume. See `docs/web-login-integration.md` for the
-Claude + Codex web-login endpoint plan.
+Instead, call `/admin/codex/credentials` with an access token or imported
+`auth_json` so `/root/.codex/auth.json` exists in the `codex-auth` volume.
+See `docs/web-login-integration.md` for the Claude + Codex web-login endpoints.
 
 ### Per-caller credential isolation (optional)
 
@@ -228,6 +243,11 @@ Codex has separate optional isolation. Send `X-Codex-Config-Dir` or
 accepts the shared default `/root/.codex` or direct children of
 `/root/.codex/users/`; nested paths, the users root, symlink escapes, and
 external paths are rejected with HTTP 400.
+
+To purge a user's local Codex slot after account deletion, send
+`DELETE /admin/codex/config-dir` with `X-Codex-Config-Dir:
+/root/.codex/users/<user_id>`. The endpoint only accepts direct children of
+`/root/.codex/users/`; missing directories return `{ok: true, existed: false}`.
 
 ## How It Works
 

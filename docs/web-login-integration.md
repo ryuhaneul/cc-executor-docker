@@ -48,11 +48,16 @@ Claude per-user isolation:
 
 ## Current Codex State
 
-`cc-executor-docker` already has additive Codex execution support:
+`cc-executor-docker` has additive Codex execution and web-login support:
 
 - `provider: "codex"` or `model: "codex/*"` routes to `codex exec`.
 - `provider: "codex"` with no model resolves to `codex/default`.
 - `/admin/codex/status` reports Codex CLI availability and auth state.
+- `/admin/codex/login/start` starts `codex login --device-auth` and returns
+  `{session_id, url, user_code}`.
+- `/admin/codex/login/complete` polls completion for the selected `CODEX_HOME`.
+- `/admin/codex/credentials`, `/admin/codex/logout`, and
+  `DELETE /admin/codex/config-dir` provide fallback import and local cleanup.
 - `X-Codex-Config-Dir` or `codex_config_dir` selects a Codex config directory.
 - Valid Codex config directories are only `/root/.codex` or direct children of
   `/root/.codex/users/`.
@@ -60,21 +65,18 @@ Claude per-user isolation:
   both `CODEX_API_KEY` and `OPENAI_API_KEY` when present.
 - `CODEX_ACCESS_TOKEN` is intentionally not consumed from environment variables.
 
-What is missing is the Codex web-login layer equivalent to Claude Code
-`/admin/oauth/start` and `/admin/oauth/complete`.
+## Codex Web Login Endpoints
 
-## Codex Web Login Endpoint Plan
-
-Add Codex endpoints without changing existing Claude endpoints.
+Codex endpoints are implemented without changing existing Claude endpoints.
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| `GET` | `/admin/codex/status` | Already exists. Keep it as the status source. |
+| `GET` | `/admin/codex/status` | Status source. |
 | `POST` | `/admin/codex/login/start` | Start a Codex browser/device login session. |
 | `POST` | `/admin/codex/login/complete` | Complete login and write auth state under `CODEX_HOME`. |
 | `POST` | `/admin/codex/credentials` | Fallback only. Import an existing Codex `auth.json` or access-token based auth. |
 | `POST` | `/admin/codex/logout` | Logout or delete local Codex auth state for the selected config dir. |
-| `DELETE` | `/admin/codex/config-dir` | Optional. Delete one per-user Codex config dir. |
+| `DELETE` | `/admin/codex/config-dir` | Delete one per-user Codex config dir. |
 
 Use the existing Bearer auth middleware for all admin endpoints.
 
@@ -98,31 +100,20 @@ Use the same security pattern for Claude and Codex web login:
   acceptable.
 - Never log access tokens, refresh tokens, copied codes, or full callback URLs.
 
-## Codex CLI Flow to Validate
+## Codex CLI Flow
 
-Before implementing Codex web login, validate the installed Codex CLI contract
-inside the container:
-
-```bash
-codex login --help
-codex login --device-auth --help
-codex login status
-```
-
-The desired web flow is:
+The implemented web flow is:
 
 1. Web app calls `/admin/codex/login/start` with `X-Codex-Config-Dir`.
 2. cc-executor starts a non-interactive Codex browser/device login.
 3. Response includes the URL plus any user-visible code required by Codex.
 4. User completes login in the browser.
-5. Web app calls `/admin/codex/login/complete` if the CLI flow requires a pasted
-   code or polling finalization.
+5. Web app calls `/admin/codex/login/complete` with the original `session_id`
+   and the same `X-Codex-Config-Dir`.
 6. cc-executor verifies with `codex login status`.
 7. Later Codex requests use the same `X-Codex-Config-Dir`.
 
-If the installed Codex CLI does not expose a stable machine-readable device
-login flow, keep the web-login design as the target and implement a fallback
-import route first:
+Advanced fallback routes are available for recovery and headless setups:
 
 - `POST /admin/codex/credentials` accepts an existing `auth.json` payload and
   writes it to the selected `CODEX_HOME` with mode `0600`.

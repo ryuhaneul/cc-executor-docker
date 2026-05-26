@@ -8,13 +8,19 @@ GET  /health               — Health check
 Admin (Bearer-protected):
   GET  /admin/status              — claude auth status
   GET  /admin/codex/status        — codex auth status
+  POST /admin/codex/login/start   — begin Codex device login
+  POST /admin/codex/login/complete — poll Codex device login completion
+  POST /admin/codex/credentials   — import Codex auth fallback
+  POST /admin/codex/logout        — remove local Codex auth state
   POST /admin/oauth/start         — begin OAuth 2.0 + PKCE flow
   POST /admin/oauth/complete      — exchange code, save .credentials.json
   POST /admin/credentials         — paste .credentials.json manually
   POST /admin/logout              — claude auth logout
   DELETE /admin/config-dir        — purge one per-user local config dir
+  DELETE /admin/codex/config-dir  — purge one per-user Codex config dir
 """
 
+import atexit
 import base64
 import hashlib
 import json
@@ -26,6 +32,7 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -190,6 +197,26 @@ def _valid_delete_config_dir(path):
     return real
 
 
+def _valid_codex_delete_config_dir(path):
+    if not path:
+        return None
+    path = os.path.normpath(path)
+    if os.path.islink(path):
+        return None
+    real = os.path.realpath(path)
+    root = os.path.realpath(USER_CODEX_CONFIG_ROOT)
+    default = os.path.realpath(DEFAULT_CODEX_CONFIG_DIR)
+    if real == root or real == default:
+        return None
+    if not real.startswith(root + os.sep):
+        return None
+    if os.path.dirname(real) != root:
+        return None
+    if os.path.basename(real) == "":
+        return None
+    return real
+
+
 def _claude_env(claude_config_dir=None):
     config_dir = _valid_claude_config_dir(claude_config_dir)
     if not config_dir:
@@ -214,12 +241,9 @@ def _codex_env(codex_config_dir=None):
     }
     env["CODEX_HOME"] = config_dir
     codex_api_key = os.environ.get("CODEX_API_KEY")
-    openai_api_key = os.environ.get("OPENAI_API_KEY")
     if codex_api_key:
         env["CODEX_API_KEY"] = codex_api_key
         env["OPENAI_API_KEY"] = codex_api_key
-    elif openai_api_key:
-        env["OPENAI_API_KEY"] = openai_api_key
     return env, config_dir
 
 
@@ -548,6 +572,94 @@ _SCOPE = "org:create_api_key user:profile user:inference"
 _OAUTH_SESSIONS = {}  # id -> {state, code_verifier, created_at}
 _OAUTH_TTL = 600
 
+_CODEX_LOGIN_SESSIONS = {}
+_CODEX_LOGIN_TTL = 900
+_CODEX_LOGIN_URL = "https://auth.openai.com/codex/device"
+_CODEX_USER_CODE_RE = re.compile(r"\b[A-Z0-9]{4}-[A-Z0-9]{5}\b")
+_ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+def _strip_ansi(text):
+    return _ANSI_RE.sub("", text or "")
+
+
+def _parse_codex_device_login_output(text):
+    clean = _strip_ansi(text)
+    url = _CODEX_LOGIN_URL if _CODEX_LOGIN_URL in clean else None
+    m = _CODEX_USER_CODE_RE.search(clean)
+    user_code = m.group(0) if m else None
+    return url, user_code
+
+
+def _terminate_proc(proc, timeout=1):
+    if not proc or proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=timeout)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def _drain_codex_login_output(session_id):
+    sess = _CODEX_LOGIN_SESSIONS.get(session_id)
+    if not sess:
+        return
+    proc = sess["proc"]
+    try:
+        for line in proc.stdout or []:
+            clean = _strip_ansi(line)
+            with sess["lock"]:
+                sess["stdout_buf"] += clean
+                url, user_code = _parse_codex_device_login_output(sess["stdout_buf"])
+                if url:
+                    sess["url"] = url
+                if user_code:
+                    sess["user_code"] = user_code
+                if sess.get("status") == "starting" and url and user_code:
+                    sess["status"] = "pending"
+    except Exception:
+        with sess["lock"]:
+            sess["status"] = "error"
+    finally:
+        rc = proc.poll()
+        with sess["lock"]:
+            if sess.get("status") not in {"error", "cancelled"} and rc is not None:
+                sess["status"] = "exited"
+
+
+def _pop_codex_login_session(session_id, kill_proc=True):
+    sess = _CODEX_LOGIN_SESSIONS.pop(session_id, None)
+    if sess and kill_proc:
+        with sess["lock"]:
+            sess["status"] = "cancelled"
+        _terminate_proc(sess.get("proc"))
+    return sess
+
+
+def _cancel_codex_login_sessions_for_home(codex_home):
+    for sid, sess in list(_CODEX_LOGIN_SESSIONS.items()):
+        if sess.get("codex_home") == codex_home:
+            _pop_codex_login_session(sid, kill_proc=True)
+
+
+def _reap_codex_login_sessions():
+    now = time.time()
+    for sid, sess in list(_CODEX_LOGIN_SESSIONS.items()):
+        if now - sess["created_at"] > _CODEX_LOGIN_TTL:
+            _pop_codex_login_session(sid, kill_proc=True)
+
+
+def _kill_all_codex_login_sessions():
+    for sid in list(_CODEX_LOGIN_SESSIONS.keys()):
+        _pop_codex_login_session(sid, kill_proc=True)
+
+
+atexit.register(_kill_all_codex_login_sessions)
+
 
 def _b64url(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
@@ -664,12 +776,12 @@ def _codex_cli_available():
         return False
 
 
-def _codex_login_status(codex_config_dir=None):
+def _codex_login_status(codex_config_dir=None, timeout=10):
     try:
         env, _ = _codex_env(codex_config_dir)
         out = subprocess.run(
             ["codex", "login", "status"],
-            capture_output=True, text=True, timeout=10, env=env,
+            capture_output=True, text=True, timeout=timeout, env=env,
         )
         return out.returncode == 0
     except Exception:
@@ -779,6 +891,14 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_oauth_complete()
         elif self.path == "/admin/logout":
             self._handle_logout()
+        elif self.path == "/admin/codex/login/start":
+            self._handle_codex_login_start()
+        elif self.path == "/admin/codex/login/complete":
+            self._handle_codex_login_complete()
+        elif self.path == "/admin/codex/credentials":
+            self._handle_codex_credentials()
+        elif self.path == "/admin/codex/logout":
+            self._handle_codex_logout()
         else:
             self.send_error(404)
 
@@ -787,6 +907,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_DELETE(self):
         if self.path == "/admin/config-dir":
             self._handle_delete_config_dir()
+        elif self.path == "/admin/codex/config-dir":
+            self._handle_codex_delete_config_dir()
         else:
             self.send_error(404)
 
@@ -809,6 +931,227 @@ class Handler(BaseHTTPRequestHandler):
             self._json_response(200, {"ok": True, "existed": True})
         except Exception as exc:
             self._json_response(500, {"error": {"message": str(exc)}})
+
+    # ── /admin/codex/config-dir ──
+
+    def _handle_codex_delete_config_dir(self):
+        if not self._check_auth():
+            self._json_response(401, {"error": {"message": "Invalid API key"}})
+            return
+        requested = self.headers.get("X-Codex-Config-Dir", "")
+        config_dir = _valid_codex_delete_config_dir(requested)
+        if config_dir is None:
+            self._json_response(400, {"error": {"message": "invalid codex config dir for delete"}})
+            return
+        _cancel_codex_login_sessions_for_home(config_dir)
+        if not os.path.exists(config_dir):
+            self._json_response(200, {"ok": True, "existed": False})
+            return
+        try:
+            shutil.rmtree(config_dir)
+            self._json_response(200, {"ok": True, "existed": True})
+        except Exception as exc:
+            self._json_response(500, {"error": {"message": str(exc)}})
+
+    # ── /admin/codex/login/* ──
+
+    def _handle_codex_login_start(self):
+        if not self._check_auth():
+            self._json_response(401, {"error": {"message": "Invalid API key"}})
+            return
+        config_dir = self._codex_config_dir_from_request()
+        if not config_dir:
+            return
+        _reap_codex_login_sessions()
+        try:
+            env, config_dir = _codex_env(config_dir)
+            proc = subprocess.Popen(
+                ["codex", "login", "--device-auth"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                env=env,
+            )
+        except FileNotFoundError:
+            self._json_response(500, {"error": {"message": "codex CLI not found"}})
+            return
+        except Exception as exc:
+            self._json_response(500, {"error": {"message": str(exc)}})
+            return
+
+        session_id = str(uuid.uuid4())
+        sess = {
+            "proc": proc,
+            "codex_home": config_dir,
+            "created_at": time.time(),
+            "status": "starting",
+            "stdout_buf": "",
+            "url": None,
+            "user_code": None,
+            "lock": threading.Lock(),
+        }
+        _CODEX_LOGIN_SESSIONS[session_id] = sess
+        threading.Thread(
+            target=_drain_codex_login_output,
+            args=(session_id,),
+            daemon=True,
+        ).start()
+
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            with sess["lock"]:
+                url = sess.get("url")
+                user_code = sess.get("user_code")
+                status = sess.get("status")
+            if url and user_code:
+                self._json_response(200, {
+                    "session_id": session_id,
+                    "url": url,
+                    "user_code": user_code,
+                })
+                return
+            if proc.poll() is not None and status != "pending":
+                break
+            time.sleep(0.1)
+
+        _pop_codex_login_session(session_id, kill_proc=True)
+        self._json_response(500, {"error": {"message": "codex login did not produce a device code"}})
+
+    def _handle_codex_login_complete(self):
+        if not self._check_auth():
+            self._json_response(401, {"error": {"message": "Invalid API key"}})
+            return
+        body = self._read_json() or {}
+        config_dir = self._codex_config_dir_from_request(body)
+        if not config_dir:
+            return
+        sid = body.get("session_id")
+        if not sid:
+            self._json_response(422, {"error": {"message": "session_id is required"}})
+            return
+        _reap_codex_login_sessions()
+        sess = _CODEX_LOGIN_SESSIONS.get(sid)
+        if not sess:
+            self._json_response(404, {"error": {"message": "login session expired or unknown"}})
+            return
+        if sess.get("codex_home") != config_dir:
+            self._json_response(403, {"error": {"message": "CODEX_HOME mismatch for login session"}})
+            return
+
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            remaining = max(0.2, min(1.0, deadline - time.time()))
+            if _codex_login_status(config_dir, timeout=remaining):
+                _pop_codex_login_session(sid, kill_proc=True)
+                self._json_response(200, {"ok": True, "loggedIn": True})
+                return
+            if sess["proc"].poll() is not None:
+                break
+            time.sleep(0.25)
+
+        if sess["proc"].poll() is not None:
+            _pop_codex_login_session(sid, kill_proc=False)
+            self._json_response(400, {"ok": False, "error": {"message": "codex login did not complete"}})
+            return
+        self._json_response(202, {"ok": False, "status": "pending"})
+
+    # ── /admin/codex/credentials ──
+
+    def _handle_codex_credentials(self):
+        if not self._check_auth():
+            self._json_response(401, {"error": {"message": "Invalid API key"}})
+            return
+        body = self._read_json() or {}
+        config_dir = self._codex_config_dir_from_request(body)
+        if not config_dir:
+            return
+
+        access_token = body.get("access_token")
+        auth_json = body.get("auth_json")
+        if access_token:
+            try:
+                env, _ = _codex_env(config_dir)
+                out = subprocess.run(
+                    ["codex", "login", "--with-access-token"],
+                    input=str(access_token) + "\n",
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    env=env,
+                )
+            except FileNotFoundError:
+                self._json_response(500, {"error": {"message": "codex CLI not found"}})
+                return
+            except Exception:
+                self._json_response(500, {"error": {"message": "codex credential import failed"}})
+                return
+            if out.returncode != 0:
+                self._json_response(400, {"ok": False, "error": {"message": "codex credential import failed"}})
+                return
+            self._json_response(200, {
+                "ok": True,
+                "loggedIn": _codex_login_status(config_dir),
+            })
+            return
+
+        if isinstance(auth_json, dict):
+            target = os.path.join(config_dir, "auth.json")
+            tmp = target + ".tmp"
+            try:
+                os.makedirs(config_dir, exist_ok=True)
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    json.dump(auth_json, fh, ensure_ascii=False)
+                try:
+                    os.chmod(tmp, 0o600)
+                except Exception:
+                    pass
+                os.replace(tmp, target)
+            except Exception:
+                try:
+                    os.unlink(tmp)
+                except Exception:
+                    pass
+                self._json_response(500, {"error": {"message": "codex auth_json write failed"}})
+                return
+            self._json_response(200, {
+                "ok": True,
+                "loggedIn": _codex_login_status(config_dir),
+            })
+            return
+
+        self._json_response(422, {"error": {"message": "access_token or auth_json is required"}})
+
+    # ── /admin/codex/logout ──
+
+    def _handle_codex_logout(self):
+        if not self._check_auth():
+            self._json_response(401, {"error": {"message": "Invalid API key"}})
+            return
+        config_dir = self._codex_config_dir_from_request()
+        if not config_dir:
+            return
+        _cancel_codex_login_sessions_for_home(config_dir)
+        try:
+            env, _ = _codex_env(config_dir)
+            subprocess.run(
+                ["codex", "logout"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                env=env,
+            )
+        except Exception:
+            pass
+        for name in ("auth.json",):
+            try:
+                os.unlink(os.path.join(config_dir, name))
+            except FileNotFoundError:
+                pass
+            except Exception as exc:
+                self._json_response(500, {"error": {"message": str(exc)}})
+                return
+        self._json_response(200, {"ok": True, "loggedIn": False})
 
     # ── /admin/credentials ──
     # Manual fallback: paste the contents of an existing .credentials.json
@@ -1303,6 +1646,8 @@ def main():
         server.serve_forever()
     except KeyboardInterrupt:
         pass
+    finally:
+        _kill_all_codex_login_sessions()
     server.server_close()
 
 
