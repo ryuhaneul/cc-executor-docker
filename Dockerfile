@@ -1,12 +1,12 @@
 FROM node:24-slim
 
-RUN npm install -g @anthropic-ai/claude-code && \
+RUN npm install -g @anthropic-ai/claude-code @openai/codex && \
     apt-get update && \
     apt-get install -y --no-install-recommends python3 ca-certificates && \
     update-ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-RUN mkdir -p /root/.claude/users && \
+RUN mkdir -p /root/.claude/users /root/.codex/users && \
     ln -sf /root/.claude/.claude.json /root/.claude.json
 
 WORKDIR /app

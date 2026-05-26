@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""cc-executor — Claude Code CLI HTTP proxy (OpenAI-compatible API).
+"""cc-executor — Claude Code and Codex CLI HTTP proxy (OpenAI-compatible API).
 
 POST /v1/chat/completions  — OpenAI-compatible chat completions
 GET  /v1/models            — Available models
@@ -7,13 +7,20 @@ GET  /health               — Health check
 
 Admin (Bearer-protected):
   GET  /admin/status              — claude auth status
+  GET  /admin/codex/status        — codex auth status
+  POST /admin/codex/login/start   — begin Codex device login
+  POST /admin/codex/login/complete — poll Codex device login completion
+  POST /admin/codex/credentials   — import Codex auth fallback
+  POST /admin/codex/logout        — remove local Codex auth state
   POST /admin/oauth/start         — begin OAuth 2.0 + PKCE flow
   POST /admin/oauth/complete      — exchange code, save .credentials.json
   POST /admin/credentials         — paste .credentials.json manually
   POST /admin/logout              — claude auth logout
   DELETE /admin/config-dir        — purge one per-user local config dir
+  DELETE /admin/codex/config-dir  — purge one per-user Codex config dir
 """
 
+import atexit
 import base64
 import hashlib
 import json
@@ -24,6 +31,8 @@ import shutil
 import ssl
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -39,15 +48,36 @@ TIMEOUT = int(os.environ.get("CC_TIMEOUT", "300"))
 WORKDIR = "/app/workdir"
 DEFAULT_CLAUDE_CONFIG_DIR = "/root/.claude"
 USER_CLAUDE_CONFIG_ROOT = "/root/.claude/users"
+DEFAULT_CODEX_CONFIG_DIR = "/root/.codex"
+USER_CODEX_CONFIG_ROOT = "/root/.codex/users"
+CODEX_DEFAULT_MODEL = os.environ.get("CODEX_DEFAULT_MODEL", "gpt-5.2-codex")
+CODEX_ALLOW_DANGER_FULL_ACCESS = (
+    os.environ.get("CC_CODEX_ALLOW_DANGER_FULL_ACCESS", "false").lower()
+    in {"1", "true", "yes", "on"}
+)
+CODEX_ENV_PASSTHROUGH = (
+    "PATH",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+)
 
 RETRY_DELAY_SECONDS = 5
 
-# Model name mapping: OpenAI-style names → Claude Code CLI model names.
+# Claude model name mapping: OpenAI-style names → Claude Code CLI model names.
 # `opus` aliases default to the 1M-context variant (`opus[1m]`, included on
 # Max plan). `sonnet` aliases default to the standard 200K variant — request
 # 1M Sonnet explicitly via `sonnet[1m]`. The `[1m]` suffix on any name maps
 # to the 1M CLI model verbatim. Use `*200k` to force 200K explicitly.
-MODEL_MAP = {
+CLAUDE_MODEL_MAP = {
     # 1M context — explicit suffix
     "opus[1m]": "opus[1m]",
     "sonnet[1m]": "sonnet[1m]",
@@ -77,7 +107,7 @@ MODEL_MAP = {
     "cc-executor/sonnet200k": "sonnet",
 }
 
-AVAILABLE_MODELS = [
+CLAUDE_AVAILABLE_MODELS = [
     {"id": "opus[1m]", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
     {"id": "sonnet[1m]", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
     {"id": "opus", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
@@ -94,6 +124,22 @@ AVAILABLE_MODELS = [
     {"id": "cc-executor/sonnet200k", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
 ]
 
+CODEX_MODEL_MAP = {
+    "codex/default": CODEX_DEFAULT_MODEL,
+    "codex/gpt-5.2-codex": "gpt-5.2-codex",
+    "codex/gpt-5-codex": "gpt-5-codex",
+    "codex/gpt-5.1-codex": "gpt-5.1-codex",
+    "codex/codex-mini-latest": "codex-mini-latest",
+}
+
+CODEX_AVAILABLE_MODELS = [
+    {"id": "codex/default", "object": "model", "created": 1700000000, "owned_by": "openai"},
+    {"id": "codex/gpt-5.2-codex", "object": "model", "created": 1700000000, "owned_by": "openai"},
+    {"id": "codex/gpt-5-codex", "object": "model", "created": 1700000000, "owned_by": "openai"},
+    {"id": "codex/gpt-5.1-codex", "object": "model", "created": 1700000000, "owned_by": "openai"},
+    {"id": "codex/codex-mini-latest", "object": "model", "created": 1700000000, "owned_by": "openai"},
+]
+
 
 def _valid_claude_config_dir(path):
     if not path:
@@ -103,6 +149,28 @@ def _valid_claude_config_dir(path):
     if real == DEFAULT_CLAUDE_CONFIG_DIR or real.startswith(root + os.sep):
         return real
     return None
+
+
+def _valid_codex_config_dir(path):
+    if not path:
+        return DEFAULT_CODEX_CONFIG_DIR
+    path = os.path.normpath(path)
+    if os.path.islink(path):
+        return None
+    real = os.path.realpath(path)
+    root = os.path.realpath(USER_CODEX_CONFIG_ROOT)
+    default = os.path.realpath(DEFAULT_CODEX_CONFIG_DIR)
+    if real == default:
+        return real
+    if real == root:
+        return None
+    if not real.startswith(root + os.sep):
+        return None
+    if os.path.dirname(real) != root:
+        return None
+    if os.path.basename(real) == "":
+        return None
+    return real
 
 
 def _valid_delete_config_dir(path):
@@ -129,14 +197,99 @@ def _valid_delete_config_dir(path):
     return real
 
 
+def _valid_codex_delete_config_dir(path):
+    if not path:
+        return None
+    path = os.path.normpath(path)
+    if os.path.islink(path):
+        return None
+    real = os.path.realpath(path)
+    root = os.path.realpath(USER_CODEX_CONFIG_ROOT)
+    default = os.path.realpath(DEFAULT_CODEX_CONFIG_DIR)
+    if real == root or real == default:
+        return None
+    if not real.startswith(root + os.sep):
+        return None
+    if os.path.dirname(real) != root:
+        return None
+    if os.path.basename(real) == "":
+        return None
+    return real
+
+
 def _claude_env(claude_config_dir=None):
     config_dir = _valid_claude_config_dir(claude_config_dir)
     if not config_dir:
         raise ValueError("invalid CLAUDE_CONFIG_DIR")
     os.makedirs(config_dir, exist_ok=True)
     env = os.environ.copy()
+    for key in ("CODEX_API_KEY", "CODEX_ACCESS_TOKEN", "CODEX_HOME", "OPENAI_API_KEY"):
+        env.pop(key, None)
     env["CLAUDE_CONFIG_DIR"] = config_dir
     return env, config_dir
+
+
+def _codex_env(codex_config_dir=None):
+    config_dir = _valid_codex_config_dir(codex_config_dir)
+    if not config_dir:
+        raise ValueError("invalid CODEX_HOME")
+    os.makedirs(config_dir, exist_ok=True)
+    env = {
+        key: os.environ[key]
+        for key in CODEX_ENV_PASSTHROUGH
+        if key in os.environ
+    }
+    env["CODEX_HOME"] = config_dir
+    codex_api_key = os.environ.get("CODEX_API_KEY")
+    if codex_api_key:
+        env["CODEX_API_KEY"] = codex_api_key
+        env["OPENAI_API_KEY"] = codex_api_key
+    return env, config_dir
+
+
+def _resolve_provider_and_model(body):
+    raw_model = body.get("model")
+    provider = body.get("provider")
+
+    if provider is None:
+        model_name = "sonnet" if raw_model is None else str(raw_model)
+        model_is_codex = model_name.startswith("codex/")
+        provider = "codex" if model_is_codex else "claude"
+    else:
+        provider = str(provider)
+        if raw_model is None:
+            model_name = "codex/default" if provider == "codex" else "sonnet"
+        else:
+            model_name = str(raw_model)
+        model_is_codex = model_name.startswith("codex/")
+
+    if provider not in {"claude", "codex"}:
+        return None, None, {
+            "message": "provider must be 'claude' or 'codex'",
+            "type": "invalid_request_error",
+        }
+
+    if provider == "claude":
+        if model_is_codex:
+            return None, None, {
+                "message": "codex/* models require provider=codex",
+                "type": "invalid_request_error",
+            }
+        return provider, CLAUDE_MODEL_MAP.get(model_name, model_name), None
+
+    if model_name in CLAUDE_MODEL_MAP and not model_is_codex:
+        return None, None, {
+            "message": "Claude model aliases require provider=claude",
+            "type": "invalid_request_error",
+        }
+    if model_name in CODEX_MODEL_MAP:
+        return provider, CODEX_MODEL_MAP[model_name], None
+    if model_name.startswith("gpt-") or model_name == "codex-mini-latest":
+        return provider, model_name, None
+    return None, None, {
+        "message": f"unsupported Codex model: {model_name}",
+        "type": "invalid_request_error",
+    }
 
 
 def _cleanup_session_file(session_id, cwd=None, claude_config_dir=None):
@@ -231,6 +384,87 @@ def _run_claude(cli_model, prompt, system_prompt=None, max_turns=None, allowed_t
         _cleanup_session_file(session_id, cwd=effective_cwd, claude_config_dir=effective_config_dir)
 
 
+def _run_codex(cli_model, prompt, system_prompt=None, cwd=None, timeout=None, add_dirs=None,
+               sandbox="read-only", codex_config_dir=None):
+    """Run codex CLI with stdin prompt and return its last-message output."""
+    effective_cwd = cwd or WORKDIR
+    effective_timeout = timeout if timeout is not None else TIMEOUT
+    if system_prompt:
+        prompt = (
+            "SYSTEM INSTRUCTIONS:\n"
+            f"{system_prompt}\n\n"
+            "CONVERSATION PROMPT:\n"
+            f"{prompt}"
+        )
+
+    try:
+        env, _ = _codex_env(codex_config_dir)
+    except ValueError as exc:
+        return False, "", str(exc)
+
+    tmp_path = None
+    try:
+        tmp = tempfile.NamedTemporaryFile(prefix="codex-last-", suffix=".txt", delete=False)
+        tmp_path = tmp.name
+        tmp.close()
+        cmd = [
+            "codex",
+            "--ask-for-approval", "never",
+            "exec",
+            "--skip-git-repo-check",
+            "--ephemeral",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "--output-last-message", tmp_path,
+            "-C", effective_cwd,
+            "-m", cli_model,
+            "--sandbox", sandbox,
+            "--color", "never",
+        ]
+        if add_dirs:
+            for d in add_dirs:
+                cmd += ["--add-dir", d]
+        cmd.append("-")
+
+        print(f"[DEBUG] cmd={' '.join(cmd)} cwd={effective_cwd} timeout={effective_timeout}",
+              file=sys.stderr)
+        result = subprocess.run(
+            cmd,
+            input=prompt,
+            capture_output=True,
+            text=True,
+            timeout=effective_timeout,
+            cwd=effective_cwd,
+            env=env,
+        )
+        try:
+            with open(tmp_path, encoding="utf-8") as fh:
+                last_message = fh.read().strip()
+        except OSError:
+            last_message = ""
+
+        if result.returncode == 0:
+            return True, last_message or result.stdout.strip(), None
+
+        print(f"[ERROR] codex returncode={result.returncode}", file=sys.stderr)
+        print(f"[ERROR] codex stderr={result.stderr.strip()[:500]}", file=sys.stderr)
+        print(f"[ERROR] codex stdout={result.stdout.strip()[:200]}", file=sys.stderr)
+        err = result.stderr.strip() or result.stdout.strip() or "codex CLI failed"
+        return False, last_message or result.stdout.strip(), err[:2000]
+    except subprocess.TimeoutExpired:
+        return False, "", "timeout"
+    except FileNotFoundError:
+        return False, "", "codex CLI not found"
+    except Exception as exc:
+        return False, "", str(exc)
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
 def _run_claude_with_retry(model, prompt, system_prompt=None, max_turns=None, allowed_tools=None,
                             cwd=None, dangerously_skip_permissions=False, timeout=None,
                             add_dirs=None, claude_config_dir=None):
@@ -240,7 +474,7 @@ def _run_claude_with_retry(model, prompt, system_prompt=None, max_turns=None, al
     Returns (ok, output, error, fallback_info) where fallback_info is either
     None or a dict {"from": "<1m model>", "to": "<200k model>"}.
     """
-    resolved = MODEL_MAP.get(model, model)
+    resolved = CLAUDE_MODEL_MAP.get(model, model)
     kwargs = dict(
         system_prompt=system_prompt,
         max_turns=max_turns,
@@ -337,6 +571,94 @@ _SCOPE = "org:create_api_key user:profile user:inference"
 
 _OAUTH_SESSIONS = {}  # id -> {state, code_verifier, created_at}
 _OAUTH_TTL = 600
+
+_CODEX_LOGIN_SESSIONS = {}
+_CODEX_LOGIN_TTL = 900
+_CODEX_LOGIN_URL = "https://auth.openai.com/codex/device"
+_CODEX_USER_CODE_RE = re.compile(r"\b[A-Z0-9]{4}-[A-Z0-9]{5}\b")
+_ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+def _strip_ansi(text):
+    return _ANSI_RE.sub("", text or "")
+
+
+def _parse_codex_device_login_output(text):
+    clean = _strip_ansi(text)
+    url = _CODEX_LOGIN_URL if _CODEX_LOGIN_URL in clean else None
+    m = _CODEX_USER_CODE_RE.search(clean)
+    user_code = m.group(0) if m else None
+    return url, user_code
+
+
+def _terminate_proc(proc, timeout=1):
+    if not proc or proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=timeout)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def _drain_codex_login_output(session_id):
+    sess = _CODEX_LOGIN_SESSIONS.get(session_id)
+    if not sess:
+        return
+    proc = sess["proc"]
+    try:
+        for line in proc.stdout or []:
+            clean = _strip_ansi(line)
+            with sess["lock"]:
+                sess["stdout_buf"] += clean
+                url, user_code = _parse_codex_device_login_output(sess["stdout_buf"])
+                if url:
+                    sess["url"] = url
+                if user_code:
+                    sess["user_code"] = user_code
+                if sess.get("status") == "starting" and url and user_code:
+                    sess["status"] = "pending"
+    except Exception:
+        with sess["lock"]:
+            sess["status"] = "error"
+    finally:
+        rc = proc.poll()
+        with sess["lock"]:
+            if sess.get("status") not in {"error", "cancelled"} and rc is not None:
+                sess["status"] = "exited"
+
+
+def _pop_codex_login_session(session_id, kill_proc=True):
+    sess = _CODEX_LOGIN_SESSIONS.pop(session_id, None)
+    if sess and kill_proc:
+        with sess["lock"]:
+            sess["status"] = "cancelled"
+        _terminate_proc(sess.get("proc"))
+    return sess
+
+
+def _cancel_codex_login_sessions_for_home(codex_home):
+    for sid, sess in list(_CODEX_LOGIN_SESSIONS.items()):
+        if sess.get("codex_home") == codex_home:
+            _pop_codex_login_session(sid, kill_proc=True)
+
+
+def _reap_codex_login_sessions():
+    now = time.time()
+    for sid, sess in list(_CODEX_LOGIN_SESSIONS.items()):
+        if now - sess["created_at"] > _CODEX_LOGIN_TTL:
+            _pop_codex_login_session(sid, kill_proc=True)
+
+
+def _kill_all_codex_login_sessions():
+    for sid in list(_CODEX_LOGIN_SESSIONS.keys()):
+        _pop_codex_login_session(sid, kill_proc=True)
+
+
+atexit.register(_kill_all_codex_login_sessions)
 
 
 def _b64url(data: bytes) -> str:
@@ -444,6 +766,28 @@ def _claude_auth_status(claude_config_dir=None):
     return {}
 
 
+def _codex_cli_available():
+    if shutil.which("codex"):
+        return True
+    try:
+        out = subprocess.run(["codex", "--version"], capture_output=True, text=True, timeout=5)
+        return out.returncode == 0
+    except Exception:
+        return False
+
+
+def _codex_login_status(codex_config_dir=None, timeout=10):
+    try:
+        env, _ = _codex_env(codex_config_dir)
+        out = subprocess.run(
+            ["codex", "login", "status"],
+            capture_output=True, text=True, timeout=timeout, env=env,
+        )
+        return out.returncode == 0
+    except Exception:
+        return False
+
+
 class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
@@ -471,6 +815,16 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return config_dir
 
+    def _codex_config_dir_from_request(self, body=None):
+        requested = self.headers.get("X-Codex-Config-Dir", "")
+        if not requested and isinstance(body, dict):
+            requested = body.get("codex_config_dir") or ""
+        config_dir = _valid_codex_config_dir(requested)
+        if not config_dir:
+            self._json_response(400, {"error": {"message": "invalid CODEX_HOME"}})
+            return None
+        return config_dir
+
     # ── GET ──
 
     def do_GET(self):
@@ -480,7 +834,10 @@ class Handler(BaseHTTPRequestHandler):
             if not self._check_auth():
                 self._json_response(401, {"error": {"message": "Invalid API key", "type": "authentication_error"}})
                 return
-            self._json_response(200, {"object": "list", "data": AVAILABLE_MODELS})
+            self._json_response(200, {
+                "object": "list",
+                "data": CLAUDE_AVAILABLE_MODELS + CODEX_AVAILABLE_MODELS,
+            })
         elif self.path == "/admin/status":
             if not self._check_auth():
                 self._json_response(401, {"error": {"message": "Invalid API key"}})
@@ -493,6 +850,30 @@ class Handler(BaseHTTPRequestHandler):
                 "loggedIn": bool(status.get("loggedIn")),
                 "authMethod": status.get("authMethod"),
                 "apiProvider": status.get("apiProvider"),
+            })
+        elif self.path == "/admin/codex/status":
+            if not self._check_auth():
+                self._json_response(401, {"error": {"message": "Invalid API key"}})
+                return
+            config_dir = self._codex_config_dir_from_request()
+            if not config_dir:
+                return
+            cli_available = _codex_cli_available()
+            has_api_key = bool(os.environ.get("CODEX_API_KEY"))
+            auth_json = os.path.join(config_dir, "auth.json")
+            auth_method = None
+            logged_in = False
+            if has_api_key:
+                auth_method = "api_key"
+                logged_in = True
+            elif os.path.exists(auth_json) and _codex_login_status(config_dir):
+                auth_method = "auth_json"
+                logged_in = True
+            self._json_response(200, {
+                "loggedIn": logged_in,
+                "authMethod": auth_method,
+                "codexHome": config_dir,
+                "cliAvailable": cli_available,
             })
         else:
             self.send_error(404)
@@ -510,6 +891,14 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_oauth_complete()
         elif self.path == "/admin/logout":
             self._handle_logout()
+        elif self.path == "/admin/codex/login/start":
+            self._handle_codex_login_start()
+        elif self.path == "/admin/codex/login/complete":
+            self._handle_codex_login_complete()
+        elif self.path == "/admin/codex/credentials":
+            self._handle_codex_credentials()
+        elif self.path == "/admin/codex/logout":
+            self._handle_codex_logout()
         else:
             self.send_error(404)
 
@@ -518,6 +907,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_DELETE(self):
         if self.path == "/admin/config-dir":
             self._handle_delete_config_dir()
+        elif self.path == "/admin/codex/config-dir":
+            self._handle_codex_delete_config_dir()
         else:
             self.send_error(404)
 
@@ -540,6 +931,227 @@ class Handler(BaseHTTPRequestHandler):
             self._json_response(200, {"ok": True, "existed": True})
         except Exception as exc:
             self._json_response(500, {"error": {"message": str(exc)}})
+
+    # ── /admin/codex/config-dir ──
+
+    def _handle_codex_delete_config_dir(self):
+        if not self._check_auth():
+            self._json_response(401, {"error": {"message": "Invalid API key"}})
+            return
+        requested = self.headers.get("X-Codex-Config-Dir", "")
+        config_dir = _valid_codex_delete_config_dir(requested)
+        if config_dir is None:
+            self._json_response(400, {"error": {"message": "invalid codex config dir for delete"}})
+            return
+        _cancel_codex_login_sessions_for_home(config_dir)
+        if not os.path.exists(config_dir):
+            self._json_response(200, {"ok": True, "existed": False})
+            return
+        try:
+            shutil.rmtree(config_dir)
+            self._json_response(200, {"ok": True, "existed": True})
+        except Exception as exc:
+            self._json_response(500, {"error": {"message": str(exc)}})
+
+    # ── /admin/codex/login/* ──
+
+    def _handle_codex_login_start(self):
+        if not self._check_auth():
+            self._json_response(401, {"error": {"message": "Invalid API key"}})
+            return
+        config_dir = self._codex_config_dir_from_request()
+        if not config_dir:
+            return
+        _reap_codex_login_sessions()
+        try:
+            env, config_dir = _codex_env(config_dir)
+            proc = subprocess.Popen(
+                ["codex", "login", "--device-auth"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                env=env,
+            )
+        except FileNotFoundError:
+            self._json_response(500, {"error": {"message": "codex CLI not found"}})
+            return
+        except Exception as exc:
+            self._json_response(500, {"error": {"message": str(exc)}})
+            return
+
+        session_id = str(uuid.uuid4())
+        sess = {
+            "proc": proc,
+            "codex_home": config_dir,
+            "created_at": time.time(),
+            "status": "starting",
+            "stdout_buf": "",
+            "url": None,
+            "user_code": None,
+            "lock": threading.Lock(),
+        }
+        _CODEX_LOGIN_SESSIONS[session_id] = sess
+        threading.Thread(
+            target=_drain_codex_login_output,
+            args=(session_id,),
+            daemon=True,
+        ).start()
+
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            with sess["lock"]:
+                url = sess.get("url")
+                user_code = sess.get("user_code")
+                status = sess.get("status")
+            if url and user_code:
+                self._json_response(200, {
+                    "session_id": session_id,
+                    "url": url,
+                    "user_code": user_code,
+                })
+                return
+            if proc.poll() is not None and status != "pending":
+                break
+            time.sleep(0.1)
+
+        _pop_codex_login_session(session_id, kill_proc=True)
+        self._json_response(500, {"error": {"message": "codex login did not produce a device code"}})
+
+    def _handle_codex_login_complete(self):
+        if not self._check_auth():
+            self._json_response(401, {"error": {"message": "Invalid API key"}})
+            return
+        body = self._read_json() or {}
+        config_dir = self._codex_config_dir_from_request(body)
+        if not config_dir:
+            return
+        sid = body.get("session_id")
+        if not sid:
+            self._json_response(422, {"error": {"message": "session_id is required"}})
+            return
+        _reap_codex_login_sessions()
+        sess = _CODEX_LOGIN_SESSIONS.get(sid)
+        if not sess:
+            self._json_response(404, {"error": {"message": "login session expired or unknown"}})
+            return
+        if sess.get("codex_home") != config_dir:
+            self._json_response(403, {"error": {"message": "CODEX_HOME mismatch for login session"}})
+            return
+
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            remaining = max(0.2, min(1.0, deadline - time.time()))
+            if _codex_login_status(config_dir, timeout=remaining):
+                _pop_codex_login_session(sid, kill_proc=True)
+                self._json_response(200, {"ok": True, "loggedIn": True})
+                return
+            if sess["proc"].poll() is not None:
+                break
+            time.sleep(0.25)
+
+        if sess["proc"].poll() is not None:
+            _pop_codex_login_session(sid, kill_proc=False)
+            self._json_response(400, {"ok": False, "error": {"message": "codex login did not complete"}})
+            return
+        self._json_response(202, {"ok": False, "status": "pending"})
+
+    # ── /admin/codex/credentials ──
+
+    def _handle_codex_credentials(self):
+        if not self._check_auth():
+            self._json_response(401, {"error": {"message": "Invalid API key"}})
+            return
+        body = self._read_json() or {}
+        config_dir = self._codex_config_dir_from_request(body)
+        if not config_dir:
+            return
+
+        access_token = body.get("access_token")
+        auth_json = body.get("auth_json")
+        if access_token:
+            try:
+                env, _ = _codex_env(config_dir)
+                out = subprocess.run(
+                    ["codex", "login", "--with-access-token"],
+                    input=str(access_token) + "\n",
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    env=env,
+                )
+            except FileNotFoundError:
+                self._json_response(500, {"error": {"message": "codex CLI not found"}})
+                return
+            except Exception:
+                self._json_response(500, {"error": {"message": "codex credential import failed"}})
+                return
+            if out.returncode != 0:
+                self._json_response(400, {"ok": False, "error": {"message": "codex credential import failed"}})
+                return
+            self._json_response(200, {
+                "ok": True,
+                "loggedIn": _codex_login_status(config_dir),
+            })
+            return
+
+        if isinstance(auth_json, dict):
+            target = os.path.join(config_dir, "auth.json")
+            tmp = target + ".tmp"
+            try:
+                os.makedirs(config_dir, exist_ok=True)
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    json.dump(auth_json, fh, ensure_ascii=False)
+                try:
+                    os.chmod(tmp, 0o600)
+                except Exception:
+                    pass
+                os.replace(tmp, target)
+            except Exception:
+                try:
+                    os.unlink(tmp)
+                except Exception:
+                    pass
+                self._json_response(500, {"error": {"message": "codex auth_json write failed"}})
+                return
+            self._json_response(200, {
+                "ok": True,
+                "loggedIn": _codex_login_status(config_dir),
+            })
+            return
+
+        self._json_response(422, {"error": {"message": "access_token or auth_json is required"}})
+
+    # ── /admin/codex/logout ──
+
+    def _handle_codex_logout(self):
+        if not self._check_auth():
+            self._json_response(401, {"error": {"message": "Invalid API key"}})
+            return
+        config_dir = self._codex_config_dir_from_request()
+        if not config_dir:
+            return
+        _cancel_codex_login_sessions_for_home(config_dir)
+        try:
+            env, _ = _codex_env(config_dir)
+            subprocess.run(
+                ["codex", "logout"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                env=env,
+            )
+        except Exception:
+            pass
+        for name in ("auth.json",):
+            try:
+                os.unlink(os.path.join(config_dir, name))
+            except FileNotFoundError:
+                pass
+            except Exception as exc:
+                self._json_response(500, {"error": {"message": str(exc)}})
+                return
+        self._json_response(200, {"ok": True, "loggedIn": False})
 
     # ── /admin/credentials ──
     # Manual fallback: paste the contents of an existing .credentials.json
@@ -722,12 +1334,16 @@ class Handler(BaseHTTPRequestHandler):
         if body is None:
             self._json_response(400, {"error": {"message": "Invalid JSON", "type": "invalid_request_error"}})
             return
-        config_dir = self._claude_config_dir_from_request(body)
-        if not config_dir:
+
+        provider, cli_model, model_error = _resolve_provider_and_model(body)
+        if model_error:
+            self._json_response(400, {"error": model_error})
             return
 
         messages = body.get("messages", [])
-        model = body.get("model", "sonnet")
+        model = body.get("model")
+        if model is None:
+            model = "codex/default" if provider == "codex" else "sonnet"
         output_files_mode = bool(body.get("output_files", False))
         max_turns = body.get("max_turns")
         request_timeout = body.get("timeout")
@@ -738,6 +1354,21 @@ class Handler(BaseHTTPRequestHandler):
         if not messages:
             self._json_response(400, {"error": {"message": "messages is required", "type": "invalid_request_error"}})
             return
+
+        if provider == "codex":
+            unsupported = []
+            if body_allowed_tools is not None:
+                unsupported.append("allowed_tools")
+            if max_turns is not None:
+                unsupported.append("max_turns")
+            if unsupported:
+                self._json_response(400, {
+                    "error": {
+                        "message": f"unsupported field for provider=codex: {', '.join(unsupported)}",
+                        "type": "unsupported_field",
+                    }
+                })
+                return
 
         # Extract system prompt and user messages
         system_prompt = None
@@ -757,6 +1388,24 @@ class Handler(BaseHTTPRequestHandler):
                 user_parts.append(f"[Previous assistant response: {content}]")
 
         prompt = "\n\n".join(user_parts)
+
+        if provider == "codex":
+            self._handle_codex_chat(
+                body=body,
+                model=model,
+                cli_model=cli_model,
+                prompt=prompt,
+                system_prompt=system_prompt,
+                output_files_mode=output_files_mode,
+                request_timeout=request_timeout,
+                body_cwd=body_cwd,
+                body_add_dirs=body_add_dirs,
+            )
+            return
+
+        config_dir = self._claude_config_dir_from_request(body)
+        if not config_dir:
+            return
 
         # Three modes:
         #   1. text-only (default)            — no tools, OpenAI-compatible.
@@ -872,6 +1521,105 @@ class Handler(BaseHTTPRequestHandler):
                     print(f"[WARN] failed to clean request dir {request_dir}: {exc}",
                           file=sys.stderr)
 
+    def _handle_codex_chat(self, body, model, cli_model, prompt, system_prompt,
+                           output_files_mode, request_timeout, body_cwd, body_add_dirs):
+        config_dir = self._codex_config_dir_from_request(body)
+        if not config_dir:
+            return
+
+        requested_sandbox = body.get("codex_sandbox")
+        if requested_sandbox is not None:
+            requested_sandbox = str(requested_sandbox)
+            if requested_sandbox not in {"read-only", "workspace-write", "danger-full-access"}:
+                self._json_response(400, {
+                    "error": {
+                        "message": "codex_sandbox must be read-only, workspace-write, or danger-full-access",
+                        "type": "invalid_request_error",
+                    }
+                })
+                return
+            if requested_sandbox == "danger-full-access" and not CODEX_ALLOW_DANGER_FULL_ACCESS:
+                self._json_response(400, {
+                    "error": {
+                        "message": "codex_sandbox=danger-full-access is disabled",
+                        "type": "invalid_request_error",
+                    }
+                })
+                return
+
+        request_dir = None
+        cwd = WORKDIR
+        add_dirs = body_add_dirs or None
+        sandbox = requested_sandbox or "read-only"
+
+        if output_files_mode:
+            request_id = uuid.uuid4().hex[:12]
+            request_dir = os.path.join(WORKDIR, f"req-{request_id}")
+            try:
+                os.makedirs(request_dir, exist_ok=True)
+            except OSError as exc:
+                self._json_response(500, {"error": {"message": f"workdir create failed: {exc}", "type": "server_error"}})
+                return
+            cwd = request_dir
+            sandbox = requested_sandbox or "workspace-write"
+            system_prompt = (
+                _FILES_MODE_INSTRUCTION + ("\n\n" + system_prompt if system_prompt else "")
+            )
+        elif body_cwd or body_add_dirs:
+            cwd = body_cwd or WORKDIR
+            sandbox = requested_sandbox or "workspace-write"
+
+        try:
+            ok, output, error = _run_codex(
+                cli_model=cli_model,
+                prompt=prompt,
+                system_prompt=system_prompt,
+                cwd=cwd,
+                timeout=request_timeout,
+                add_dirs=add_dirs,
+                sandbox=sandbox,
+                codex_config_dir=config_dir,
+            )
+
+            if not ok:
+                err_msg = error or "Generation failed"
+                print(f"[ERROR] codex model={model} error={err_msg}", file=sys.stderr)
+                if output:
+                    print(f"[ERROR] codex stdout={output[:500]}", file=sys.stderr)
+                self._json_response(500, {
+                    "error": {"message": err_msg, "type": "server_error"}
+                })
+                return
+
+            files_payload = _collect_files(request_dir) if output_files_mode else None
+
+            response = {
+                "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": output},
+                    "finish_reason": "stop",
+                }],
+                "usage": {
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                },
+            }
+            if files_payload is not None:
+                response["files"] = files_payload
+            self._json_response(200, response)
+        finally:
+            if request_dir:
+                try:
+                    shutil.rmtree(request_dir)
+                except OSError as exc:
+                    print(f"[WARN] failed to clean request dir {request_dir}: {exc}",
+                          file=sys.stderr)
+
     # ── Response helper ──
 
     def _json_response(self, status, data):
@@ -898,6 +1646,8 @@ def main():
         server.serve_forever()
     except KeyboardInterrupt:
         pass
+    finally:
+        _kill_all_codex_login_sessions()
     server.server_close()
 
 

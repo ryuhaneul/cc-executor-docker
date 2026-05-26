@@ -8,8 +8,13 @@ services:
     environment:
       - CC_API_KEY=${CC_API_KEY}
       - CC_TIMEOUT=${CC_TIMEOUT:-300}
+      - CODEX_API_KEY=${CODEX_API_KEY:-}
+      - CC_CODEX_ALLOW_DANGER_FULL_ACCESS=${CC_CODEX_ALLOW_DANGER_FULL_ACCESS:-false}
+      - CODEX_DEFAULT_MODEL=${CODEX_DEFAULT_MODEL:-gpt-5.2-codex}
     volumes:
       - cc-auth:/root/.claude
+      - codex-auth:/root/.codex
 
 volumes:
   cc-auth:
+  codex-auth:
