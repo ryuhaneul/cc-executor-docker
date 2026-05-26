@@ -50,7 +50,7 @@ DEFAULT_CLAUDE_CONFIG_DIR = "/root/.claude"
 USER_CLAUDE_CONFIG_ROOT = "/root/.claude/users"
 DEFAULT_CODEX_CONFIG_DIR = "/root/.codex"
 USER_CODEX_CONFIG_ROOT = "/root/.codex/users"
-CODEX_DEFAULT_MODEL = os.environ.get("CODEX_DEFAULT_MODEL", "gpt-5.2-codex")
+CODEX_DEFAULT_MODEL = os.environ.get("CODEX_DEFAULT_MODEL", "gpt-5.5")
 CODEX_ALLOW_DANGER_FULL_ACCESS = (
     os.environ.get("CC_CODEX_ALLOW_DANGER_FULL_ACCESS", "false").lower()
     in {"1", "true", "yes", "on"}
@@ -130,18 +130,12 @@ CLAUDE_AVAILABLE_MODELS = [
 
 CODEX_MODEL_MAP = {
     "codex/default": CODEX_DEFAULT_MODEL,
-    "codex/gpt-5.2-codex": "gpt-5.2-codex",
-    "codex/gpt-5-codex": "gpt-5-codex",
-    "codex/gpt-5.1-codex": "gpt-5.1-codex",
-    "codex/codex-mini-latest": "codex-mini-latest",
+    "codex/gpt-5.5": "gpt-5.5",
 }
 
 CODEX_AVAILABLE_MODELS = [
     {"id": "codex/default", "object": "model", "created": 1700000000, "owned_by": "openai"},
-    {"id": "codex/gpt-5.2-codex", "object": "model", "created": 1700000000, "owned_by": "openai"},
-    {"id": "codex/gpt-5-codex", "object": "model", "created": 1700000000, "owned_by": "openai"},
-    {"id": "codex/gpt-5.1-codex", "object": "model", "created": 1700000000, "owned_by": "openai"},
-    {"id": "codex/codex-mini-latest", "object": "model", "created": 1700000000, "owned_by": "openai"},
+    {"id": "codex/gpt-5.5", "object": "model", "created": 1700000000, "owned_by": "openai"},
 ]
 
 
@@ -288,7 +282,7 @@ def _resolve_provider_and_model(body):
         }
     if model_name in CODEX_MODEL_MAP:
         return provider, CODEX_MODEL_MAP[model_name], None
-    if model_name.startswith("gpt-") or model_name == "codex-mini-latest":
+    if model_name in CODEX_MODEL_MAP.values():
         return provider, model_name, None
     return None, None, {
         "message": f"unsupported Codex model: {model_name}",
@@ -422,9 +416,12 @@ def _run_codex(cli_model, prompt, system_prompt=None, cwd=None, timeout=None, ad
             "--output-last-message", tmp_path,
             "-C", effective_cwd,
             "-m", cli_model,
-            "--sandbox", sandbox,
             "--color", "never",
         ]
+        if sandbox == "danger-full-access":
+            cmd.append("--dangerously-bypass-approvals-and-sandbox")
+        else:
+            cmd += ["--sandbox", sandbox]
         if add_dirs:
             for d in add_dirs:
                 cmd += ["--add-dir", d]

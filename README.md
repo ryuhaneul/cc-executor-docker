@@ -181,14 +181,11 @@ appended.
 
 | Model ID | CLI Model | Notes |
 |----------|-----------|-------|
-| `codex/default` | `CODEX_DEFAULT_MODEL` | Defaults to `gpt-5.2-codex` |
-| `codex/gpt-5.2-codex` | `gpt-5.2-codex` | Recommended default |
-| `codex/gpt-5-codex` | `gpt-5-codex` | Available explicit model |
-| `codex/gpt-5.1-codex` | `gpt-5.1-codex` | Available explicit model |
-| `codex/codex-mini-latest` | `codex-mini-latest` | Legacy/deprecated possibility; not recommended as default |
+| `codex/default` | `CODEX_DEFAULT_MODEL` | Defaults to `gpt-5.5` |
+| `codex/gpt-5.5` | `gpt-5.5` | Available explicit model |
 
-With `provider: "codex"`, bare `gpt-*` model names and
-`codex-mini-latest` are also accepted directly. Claude aliases such as
+With `provider: "codex"`, only the mapped Codex model ids above and their
+resolved CLI model value, `gpt-5.5`, are accepted. Claude aliases such as
 `sonnet` are rejected when `provider` is `codex`, and `codex/*` models are
 rejected when `provider` is `claude`.
 
@@ -200,7 +197,7 @@ rejected when `provider` is `claude`.
 | `CC_PORT` | `9100` | Host port mapping |
 | `CC_TIMEOUT` | `300` | CLI execution timeout (seconds) |
 | `CODEX_API_KEY` | unset | Optional Codex/OpenAI API key fallback. When set, it is passed to Codex as both `CODEX_API_KEY` and `OPENAI_API_KEY`. |
-| `CODEX_DEFAULT_MODEL` | `gpt-5.2-codex` | CLI model used by `model: "codex/default"`. |
+| `CODEX_DEFAULT_MODEL` | `gpt-5.5` | CLI model used by `model: "codex/default"`. |
 | `CC_CODEX_ALLOW_DANGER_FULL_ACCESS` | `false` | Enables `codex_sandbox: "danger-full-access"` only when set to `true`. **See the security note below before enabling.** |
 | `CC_CODEX_REQUIRE_USER_AUTH` | `false` | When `true`, disables shared `CODEX_API_KEY` fallback for Codex status and generation. Use `true` for web deployments with per-user ChatGPT login. |
 
