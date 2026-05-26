@@ -1,6 +1,13 @@
 # cc-executor-docker
 
-OpenAI-compatible API proxy for Claude Code CLI. Wraps `claude --print` in a Docker container with Bearer token authentication.
+OpenAI-compatible API proxy for Claude Code CLI and OpenAI Codex CLI. Wraps
+`claude --print` and `codex exec` in a Docker container with Bearer token
+authentication.
+
+For web integrations such as vod-clip, see
+`docs/web-login-integration.md` for the shared Claude Code and Codex browser
+login handoff. Headless or single-user deployments may still use CLI-prepared
+auth or API-key fallback where supported.
 
 ## Endpoints
 
@@ -10,6 +17,7 @@ OpenAI-compatible API proxy for Claude Code CLI. Wraps `claude --print` in a Doc
 | GET | `/v1/models` | Bearer | List available models |
 | GET | `/health` | None | Health check |
 | GET | `/admin/status` | Bearer | Proxy `claude auth status` → `{loggedIn, authMethod, apiProvider}` |
+| GET | `/admin/codex/status` | Bearer | Codex auth status → `{loggedIn, authMethod, codexHome, cliAvailable}` |
 | POST | `/admin/oauth/start` | Bearer | Begin an OAuth 2.0 + PKCE login. Returns `{session_id, url}` — open the URL in a browser, approve, copy the resulting `code#state` blob. |
 | POST | `/admin/oauth/complete` | Bearer | Body `{session_id, code}`. Exchanges the code against Anthropic's token endpoint and writes the bundle to `/root/.claude/.credentials.json` (0600). |
 | POST | `/admin/credentials` | Bearer | Manual fallback. Body `{credentials: {claudeAiOauth: {...}}}` — writes the bundle verbatim. Use when a valid `.credentials.json` already exists (e.g. produced by `claude auth login` on another machine). |
@@ -58,6 +66,8 @@ can POST it to `/admin/credentials` to skip the OAuth dance entirely.
 
 ## Quick Start
 
+### Claude Code
+
 ```bash
 # 1. Configure
 cp .env.example .env
@@ -76,7 +86,41 @@ curl http://localhost:9100/v1/chat/completions \
   -d '{"model": "sonnet", "messages": [{"role": "user", "content": "Hello"}]}'
 ```
 
+### Codex
+
+For web-app use, connect Codex through the application's browser-login flow.
+For headless, single-user, or test deployments, API-key mode remains available
+as a fallback.
+
+```bash
+# 1. Configure
+cp .env.example .env
+# Edit .env — set CC_API_KEY
+# Optional fallback only: set CODEX_API_KEY
+
+# 2. Start
+docker compose up -d --build
+
+# 3. Check Codex auth
+curl http://localhost:9100/admin/codex/status \
+  -H "Authorization: Bearer YOUR_API_KEY"
+
+# 4. Test
+curl http://localhost:9100/v1/chat/completions \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "codex/default", "messages": [{"role": "user", "content": "Hello"}]}'
+```
+
+For vod-clip web-login implementation details, see
+`docs/web-login-integration.md`. Until those endpoints are implemented, you may
+prepare the `codex-auth` volume with `auth.json` by running
+`codex login --with-access-token` inside the container, then keep
+`CODEX_API_KEY` empty.
+
 ## Models
+
+### Claude Code
 
 `opus` aliases default to the **1M-context** variant. `sonnet` aliases default
 to the standard **200K** variant — to use 1M Sonnet, request `sonnet[1m]`
@@ -107,12 +151,31 @@ explicitly. The `[1m]` suffix on any name maps to the 1M CLI model verbatim.
 | `sonnet200k` | `sonnet` | 200K (alias of `sonnet`) |
 | `cc-executor/sonnet200k` | `sonnet` | 200K (alias of `sonnet`) |
 
-See `MODEL_MAP` in `server.py` for the source of truth.
+See `CLAUDE_MODEL_MAP` in `server.py` for the source of truth.
 
 > **Note on 1M access** — 1M context for Opus is included on the Max plan.
 > Sonnet 1M availability depends on account state (see Anthropic docs). If a
 > `[1m]` call fails, the proxy automatically retries and falls back to 200K
 > (see below).
+
+### Codex
+
+Codex models are opt-in via `provider: "codex"` or a `codex/*` model id. The
+Claude model list is returned first from `/v1/models`; Codex entries are
+appended.
+
+| Model ID | CLI Model | Notes |
+|----------|-----------|-------|
+| `codex/default` | `CODEX_DEFAULT_MODEL` | Defaults to `gpt-5.2-codex` |
+| `codex/gpt-5.2-codex` | `gpt-5.2-codex` | Recommended default |
+| `codex/gpt-5-codex` | `gpt-5-codex` | Available explicit model |
+| `codex/gpt-5.1-codex` | `gpt-5.1-codex` | Available explicit model |
+| `codex/codex-mini-latest` | `codex-mini-latest` | Legacy/deprecated possibility; not recommended as default |
+
+With `provider: "codex"`, bare `gpt-*` model names and
+`codex-mini-latest` are also accepted directly. Claude aliases such as
+`sonnet` are rejected when `provider` is `codex`, and `codex/*` models are
+rejected when `provider` is `claude`.
 
 ## Environment Variables
 
@@ -121,10 +184,22 @@ See `MODEL_MAP` in `server.py` for the source of truth.
 | `CC_API_KEY` | (required) | Bearer token for API authentication |
 | `CC_PORT` | `9100` | Host port mapping |
 | `CC_TIMEOUT` | `300` | CLI execution timeout (seconds) |
+| `CODEX_API_KEY` | unset | Optional Codex/OpenAI API key fallback. When set, it is passed to Codex as both `CODEX_API_KEY` and `OPENAI_API_KEY`. |
+| `CODEX_DEFAULT_MODEL` | `gpt-5.2-codex` | CLI model used by `model: "codex/default"`. |
+| `CC_CODEX_ALLOW_DANGER_FULL_ACCESS` | `false` | Enables `codex_sandbox: "danger-full-access"` only when set to `true`. |
 
 ## Authentication
 
 Claude Code login is stored in a named Docker volume (`cc-auth`). Run `bash login.sh` once after first deploy. The session persists across container restarts.
+
+Codex auth is stored separately in the `codex-auth` named volume mounted at
+`/root/.codex`. Web applications can add a browser-login flow on top of this
+storage model; headless deployments may use CLI-prepared auth or
+`CODEX_API_KEY`. If you need access-token auth, do not set
+`CODEX_ACCESS_TOKEN` in `.env`; this proxy does not consume it directly.
+Instead, run `codex login --with-access-token` so `/root/.codex/auth.json`
+exists in the `codex-auth` volume. See `docs/web-login-integration.md` for the
+Claude + Codex web-login endpoint plan.
 
 ### Per-caller credential isolation (optional)
 
@@ -148,9 +223,16 @@ root. Missing directories return `{ok: true, existed: false}` so callers can
 treat cleanup as idempotent. This is a local credential/state purge only and
 does not revoke the remote Anthropic token.
 
+Codex has separate optional isolation. Send `X-Codex-Config-Dir` or
+`codex_config_dir` pointing at `/root/.codex/users/<user_id>`. The proxy only
+accepts the shared default `/root/.codex` or direct children of
+`/root/.codex/users/`; nested paths, the users root, symlink escapes, and
+external paths are rejected with HTTP 400.
+
 ## How It Works
 
-Each request spawns `claude --print --system-prompt "..." "prompt"` as a subprocess. This uses Claude Code's `--print` mode which passes system prompts directly without SDK agent framework interference — system prompt adherence is reliable.
+Claude requests spawn `claude --print --system-prompt "..."` as a subprocess.
+Codex requests spawn `codex exec` and pass the composed prompt on stdin.
 
 The HTTP server is a `ThreadingHTTPServer`, so multiple `/v1/chat/completions`
 requests are handled **concurrently** — each in its own thread, each spawning
@@ -167,7 +249,7 @@ For each `POST /v1/chat/completions`:
 1. **Auth check** — verify `Authorization: Bearer <CC_API_KEY>`.
 2. **Parse body** — extract `messages`; join `system` messages into
    `--system-prompt` and concatenate `user`/`assistant` turns into the prompt.
-3. **Resolve model** — look up the requested model in `MODEL_MAP` to get the
+3. **Resolve model** — look up the requested model in `CLAUDE_MODEL_MAP` to get the
    CLI-level name (e.g. `opus` → `opus[1m]`, `opus200k` → `opus`).
 4. **Run with retry/fallback** (`_run_claude_with_retry`):
    1. Invoke `claude --print --setting-sources "" --model <resolved> …`.
@@ -225,8 +307,8 @@ the extra `fallback` key.
 
 ### Tool-enabled modes
 
-By default, `/v1/chat/completions` is text-only — no tools, single-shot prompt
-in / model text out. For workloads where one Claude response is too small
+By default, `/v1/chat/completions` is text-only — single-shot prompt in / model
+text out. For workloads where one Claude response is too small
 (e.g. cleaning up a 900K-token YouTube transcript whose output runs into the
 millions of tokens), there are two opt-in tool-enabled modes:
 
@@ -242,7 +324,7 @@ millions of tokens), there are two opt-in tool-enabled modes:
 
 #### How tools are unlocked
 
-Both tool-enabled modes pass the following flags to `claude --print`:
+For Claude, both tool-enabled modes pass the following flags to `claude --print`:
 
 | Flag | Why |
 |------|-----|
@@ -255,6 +337,17 @@ Both tool-enabled modes pass the following flags to `claude --print`:
 Both `--allow-dangerously-skip-permissions` and `--dangerously-skip-permissions`
 are required — the first alone only unlocks the option, and the second alone
 is a no-op on builds where the gate is enforced.
+
+For Codex, `allowed_tools` and `max_turns` are not supported and are rejected
+with HTTP 400 instead of being ignored. Codex control is sandbox-based:
+
+| Field | Default | Notes |
+|-------|---------|-------|
+| `codex_sandbox` | `read-only` text-only, `workspace-write` file/direct-fs | Allowed: `read-only`, `workspace-write`, `danger-full-access`. |
+
+`danger-full-access` is blocked unless
+`CC_CODEX_ALLOW_DANGER_FULL_ACCESS=true` is set. Keep it disabled for normal
+deployments.
 
 #### Body fields (all modes)
 
