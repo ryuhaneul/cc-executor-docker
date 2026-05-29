@@ -322,5 +322,7 @@ def prepare_slot_dirs(slot_id: str, config_dir: Path, ws_cwd: Path, uid: int) ->
     for path in (config_dir, ws_cwd):
         path.mkdir(parents=True, exist_ok=True)
         _reject_symlink_components(path)
-        os.chown(path, uid, uid)
+        # chmod 를 chown 보다 먼저: chown 후엔 root 가 소유자가 아니라
+        # CAP_FOWNER 없이 chmod 불가(EPERM). root 소유일 때 chmod 후 chown.
         os.chmod(path, 0o700)
+        os.chown(path, uid, uid)
