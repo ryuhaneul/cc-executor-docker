@@ -59,6 +59,10 @@ CODEX_REQUIRE_USER_AUTH = (
     os.environ.get("CC_CODEX_REQUIRE_USER_AUTH", "false").lower()
     in {"1", "true", "yes", "on"}
 )
+DISABLE_LEGACY = (
+    os.environ.get("CC_DISABLE_LEGACY", "false").lower()
+    in {"1", "true", "yes", "on"}
+)
 CODEX_ENV_PASSTHROUGH = (
     "PATH",
     "HOME",
@@ -895,6 +899,9 @@ class Handler(BaseHTTPRequestHandler):
     # ── GET ──
 
     def do_GET(self):
+        if DISABLE_LEGACY and (self.path.startswith("/v1/") or self.path.startswith("/admin/")):
+            self.send_error(404 if self.path.startswith("/v1/") else 403)
+            return
         if self.path == "/health":
             self._json_response(200, {"status": "ok"})
         elif self.path == "/v1/models":
@@ -947,6 +954,9 @@ class Handler(BaseHTTPRequestHandler):
     # ── POST ──
 
     def do_POST(self):
+        if DISABLE_LEGACY and (self.path.startswith("/v1/") or self.path.startswith("/admin/")):
+            self.send_error(404 if self.path.startswith("/v1/") else 403)
+            return
         if self.path == "/v1/chat/completions":
             self._handle_chat_completions()
         elif self.path == "/admin/credentials":
@@ -971,6 +981,9 @@ class Handler(BaseHTTPRequestHandler):
     # ── DELETE ──
 
     def do_DELETE(self):
+        if DISABLE_LEGACY and self.path.startswith("/admin/"):
+            self.send_error(403)
+            return
         if self.path == "/admin/config-dir":
             self._handle_delete_config_dir()
         elif self.path == "/admin/codex/config-dir":

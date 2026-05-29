@@ -5,17 +5,28 @@ services:
     restart: unless-stopped
     ports:
       - "${CC_PORT:-9100}:9100"
+      - "${WD_PORT:-9101}:9101"
     environment:
       - CC_API_KEY=${CC_API_KEY}
+      - WD_CLAIM_SIGNING_SECRET=${WD_CLAIM_SIGNING_SECRET}
+      - CC_DISABLE_LEGACY=${CC_DISABLE_LEGACY:-false}
       - CC_TIMEOUT=${CC_TIMEOUT:-300}
       - CODEX_API_KEY=${CODEX_API_KEY:-}
       - CC_CODEX_ALLOW_DANGER_FULL_ACCESS=${CC_CODEX_ALLOW_DANGER_FULL_ACCESS:-false}
       - CC_CODEX_REQUIRE_USER_AUTH=${CC_CODEX_REQUIRE_USER_AUTH:-false}
       - CODEX_DEFAULT_MODEL=${CODEX_DEFAULT_MODEL:-gpt-5.5}
     volumes:
+      - wd-data:/data
       - cc-auth:/root/.claude
       - codex-auth:/root/.codex
+      - wd-auth:/data/auth
+      - wd-ws:/data/ws
+      - wd-tmp:/data/tmp
 
 volumes:
+  wd-data:
   cc-auth:
   codex-auth:
+  wd-auth:
+  wd-ws:
+  wd-tmp:
