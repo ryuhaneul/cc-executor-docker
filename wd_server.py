@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import os
-import shutil
+import json
+import re
 import subprocess
 import time
+import uuid
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -21,6 +24,7 @@ from wd_security import (
 API_KEY = os.environ.get("CC_API_KEY", "")
 CLAIM_SECRET = os.environ.get("WD_CLAIM_SIGNING_SECRET", "")
 TIMEOUT = int(os.environ.get("CC_TIMEOUT", "300"))
+MAX_TIMEOUT = int(os.environ.get("WD_MAX_TIMEOUT", "600"))
 ENV_WHITELIST = (
     "PATH",
     "LANG",
@@ -43,6 +47,11 @@ SECRET_ENV_KEYS = {
     "ANTHROPIC_API_KEY",
     "CLAUDE_CODE_OAUTH_TOKEN",
 }
+_SENSITIVE_PATTERNS = (
+    re.compile(r"Bearer\s+[A-Za-z0-9._~+/=-]+", re.IGNORECASE),
+    re.compile(r"\b(?:sk|sk-proj|sk-ant|sk-codex)-[A-Za-z0-9._-]+"),
+    re.compile(r"\b[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\b"),
+)
 
 app = FastAPI(title="cc-executor webductor mode")
 
@@ -61,22 +70,377 @@ def _child_env() -> dict[str, str]:
     return env
 
 
-def _argv_from_body(body: Mapping[str, Any]) -> list[str]:
-    command = str(body.get("command") or "echo")
-    args = body.get("args", [])
-    if args is None:
-        args = []
-    if not isinstance(args, list) or not all(isinstance(item, str) for item in args):
-        raise HTTPException(status_code=422, detail="args must be a string list")
+def _mask_secrets(value: str) -> str:
+    masked = value
+    for pattern in _SENSITIVE_PATTERNS:
+        masked = pattern.sub("[REDACTED]", masked)
+    return masked
 
-    if command == "echo":
-        return [shutil.which("echo") or "/bin/echo", *(args or ["wd-stage0"])]
-    if command == "id":
-        allowed = {"-u", "-g", "-G", "-un", "-gn"}
-        if any(item not in allowed for item in args):
-            raise HTTPException(status_code=422, detail="unsupported id args")
-        return [shutil.which("id") or "/usr/bin/id", *(args or ["-u"])]
-    raise HTTPException(status_code=422, detail="command must be echo or id")
+
+def _bounded_timeout(body: Mapping[str, Any]) -> int:
+    raw_timeout = body.get("timeout")
+    if raw_timeout is None:
+        requested = TIMEOUT
+    elif isinstance(raw_timeout, int) and not isinstance(raw_timeout, bool):
+        requested = raw_timeout
+    else:
+        raise HTTPException(status_code=422, detail="timeout must be an integer")
+    if requested <= 0:
+        raise HTTPException(status_code=422, detail="timeout must be positive")
+    return min(requested, MAX_TIMEOUT)
+
+
+def _run_body(body: Mapping[str, Any]) -> tuple[str, str | None, str | None, str | None, int]:
+    prompt = body.get("prompt")
+    if not isinstance(prompt, str) or not prompt:
+        raise HTTPException(status_code=422, detail="prompt is required")
+
+    model = body.get("model")
+    system_prompt = body.get("system_prompt")
+    resume = body.get("resume")
+    for name, value in (
+        ("model", model),
+        ("system_prompt", system_prompt),
+        ("resume", resume),
+    ):
+        if value is not None and not isinstance(value, str):
+            raise HTTPException(status_code=422, detail=f"{name} must be a string")
+
+    return prompt, model, system_prompt, resume, _bounded_timeout(body)
+
+
+def _provider_env(provider: str, config_dir: Path, ws_cwd: Path) -> dict[str, str]:
+    env = _child_env()
+    env["HOME"] = str(config_dir)
+    env["TMPDIR"] = str(ws_cwd)
+    if provider == "claude":
+        env["CLAUDE_CONFIG_DIR"] = str(config_dir)
+    elif provider == "codex":
+        env["CODEX_HOME"] = str(config_dir)
+    return env
+
+
+def _append_common_claude_args(
+    argv: list[str],
+    *,
+    model: str | None,
+    system_prompt: str | None,
+    resume: str | None,
+    tools_allowed: bool,
+) -> None:
+    if model:
+        argv += ["--model", model]
+    if system_prompt:
+        argv += ["--system-prompt", system_prompt]
+    if resume:
+        argv += ["--resume", resume]
+    if not tools_allowed:
+        argv += ["--disallowedTools", "*"]
+
+
+def _build_claude_argv(
+    *,
+    model: str | None,
+    system_prompt: str | None,
+    resume: str | None,
+    tools_allowed: bool,
+) -> list[str]:
+    argv = ["claude", "--print", "--output-format", "json", "--setting-sources", ""]
+    _append_common_claude_args(
+        argv,
+        model=model,
+        system_prompt=system_prompt,
+        resume=resume,
+        tools_allowed=tools_allowed,
+    )
+    return argv
+
+
+def _build_codex_argv(
+    *,
+    model: str | None,
+    ws_cwd: Path,
+    last_message_path: Path,
+    resume: str | None,
+    tools_allowed: bool,
+) -> list[str]:
+    argv = [
+        "codex",
+        "exec",
+        "--json",
+        "-C",
+        str(ws_cwd),
+        "--skip-git-repo-check",
+        "--output-last-message",
+        str(last_message_path),
+        "--ask-for-approval",
+        "never",
+        "--color",
+        "never",
+    ]
+    if model:
+        argv += ["-m", model]
+    if tools_allowed:
+        argv += ["--sandbox", "workspace-write"]
+    else:
+        # Codex has no Stage 1 claim-aware tool ACL. Read-only sandbox plus
+        # never-approval is the conservative non-mutating mapping.
+        argv += ["--sandbox", "read-only"]
+    if resume:
+        argv += ["resume", resume]
+    argv.append("-")
+    return argv
+
+
+def _json_objects(stdout: str) -> list[dict[str, Any]]:
+    stripped = stdout.strip()
+    if not stripped:
+        return []
+    try:
+        parsed = json.loads(stripped)
+        if isinstance(parsed, dict):
+            return [parsed]
+    except json.JSONDecodeError:
+        pass
+
+    objects: list[dict[str, Any]] = []
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            objects.append(parsed)
+    return objects
+
+
+def _usage_from(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    return {}
+
+
+def _content_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts = []
+        for item in value:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text") or item.get("content")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "".join(parts)
+    if isinstance(value, dict):
+        text = value.get("text") or value.get("content")
+        if isinstance(text, str):
+            return text
+    return ""
+
+
+def _parse_claude_output(stdout: str) -> tuple[str, dict[str, Any], str | None, str | None]:
+    objects = _json_objects(stdout)
+    if not objects:
+        return stdout.strip(), {}, None, None
+    payload = objects[-1]
+    text = payload.get("result") or payload.get("text") or _content_text(payload.get("content"))
+    usage = _usage_from(payload.get("usage"))
+    session_id = payload.get("session_id")
+    model = payload.get("model")
+    return (
+        text if isinstance(text, str) else "",
+        usage,
+        session_id if isinstance(session_id, str) else None,
+        model if isinstance(model, str) else None,
+    )
+
+
+def _message_text_from_event(event: Mapping[str, Any]) -> str:
+    if event.get("role") == "assistant":
+        text = _content_text(event.get("content") or event.get("message"))
+        if text:
+            return text
+    item = event.get("item")
+    if isinstance(item, dict) and item.get("role") == "assistant":
+        text = _content_text(item.get("content"))
+        if text:
+            return text
+    message = event.get("message")
+    if isinstance(message, dict) and message.get("role") == "assistant":
+        text = _content_text(message.get("content"))
+        if text:
+            return text
+    delta = event.get("delta")
+    if event.get("type") in {"assistant_message", "message"} and isinstance(delta, str):
+        return delta
+    return ""
+
+
+def _parse_codex_output(
+    stdout: str,
+    last_message: str,
+) -> tuple[str, dict[str, Any], str | None, str | None]:
+    text = last_message.strip()
+    usage: dict[str, Any] = {}
+    session_id: str | None = None
+    model: str | None = None
+    assistant_parts: list[str] = []
+    for event in _json_objects(stdout):
+        if not session_id:
+            raw_id = event.get("thread_id") or event.get("session_id")
+            if isinstance(raw_id, str):
+                session_id = raw_id
+        if not model and isinstance(event.get("model"), str):
+            model = str(event["model"])
+        event_usage = event.get("usage") or event.get("token_usage")
+        if isinstance(event_usage, dict):
+            usage = dict(event_usage)
+        event_text = _message_text_from_event(event)
+        if event_text:
+            assistant_parts.append(event_text)
+    if not text and assistant_parts:
+        text = assistant_parts[-1]
+    return text, usage, session_id, model
+
+
+def _run_subprocess(
+    argv: list[str],
+    *,
+    prompt: str,
+    timeout: int,
+    cwd: Path,
+    env: Mapping[str, str],
+    slot_uid: int,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        argv,
+        input=prompt,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        cwd=str(cwd),
+        env=dict(env),
+        user=slot_uid,
+        group=slot_uid,
+        extra_groups=[],
+        start_new_session=True,
+    )
+
+
+def _execute_provider(
+    *,
+    provider: str,
+    prompt: str,
+    model: str | None,
+    system_prompt: str | None,
+    resume: str | None,
+    tools_allowed: bool,
+    timeout: int,
+    config_dir: Path,
+    ws_cwd: Path,
+    slot_uid: int,
+) -> tuple[subprocess.CompletedProcess[str], str, dict[str, Any], str | None, str | None, list[str], dict[str, str]]:
+    env = _provider_env(provider, config_dir, ws_cwd)
+    if provider == "claude":
+        argv = _build_claude_argv(
+            model=model,
+            system_prompt=system_prompt,
+            resume=resume,
+            tools_allowed=tools_allowed,
+        )
+        result = _run_subprocess(
+            argv,
+            prompt=prompt,
+            timeout=timeout,
+            cwd=ws_cwd,
+            env=env,
+            slot_uid=slot_uid,
+        )
+        text, usage, session_id, actual_model = _parse_claude_output(result.stdout)
+        return result, text, usage, session_id, actual_model or model, argv, env
+
+    codex_prompt = prompt
+    if system_prompt:
+        codex_prompt = (
+            "SYSTEM INSTRUCTIONS:\n"
+            f"{system_prompt}\n\n"
+            "CONVERSATION PROMPT:\n"
+            f"{prompt}"
+        )
+    last_message_path = ws_cwd / f".wd-codex-last-{uuid.uuid4().hex}.txt"
+    argv = _build_codex_argv(
+        model=model,
+        ws_cwd=ws_cwd,
+        last_message_path=last_message_path,
+        resume=resume,
+        tools_allowed=tools_allowed,
+    )
+    try:
+        result = _run_subprocess(
+            argv,
+            prompt=codex_prompt,
+            timeout=timeout,
+            cwd=ws_cwd,
+            env=env,
+            slot_uid=slot_uid,
+        )
+        try:
+            last_message = last_message_path.read_text(encoding="utf-8")
+        except OSError:
+            last_message = ""
+        text, usage, session_id, actual_model = _parse_codex_output(result.stdout, last_message)
+        return result, text, usage, session_id, actual_model or model, argv, env
+    finally:
+        try:
+            last_message_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _error_from_result(result: subprocess.CompletedProcess[str]) -> str | None:
+    if result.returncode == 0:
+        return None
+    raw = result.stderr.strip() or result.stdout.strip() or "CLI exited without output"
+    return _mask_secrets(raw[:2000])
+
+
+def _run_response(
+    *,
+    claims: Mapping[str, Any],
+    slot_uid: int,
+    config_dir: Path,
+    ws_cwd: Path,
+    text: str,
+    usage: Mapping[str, Any],
+    session_id: str | None,
+    model: str | None,
+    duration_ms: int,
+    returncode: int,
+    error: str | None,
+    env: Mapping[str, str],
+) -> dict[str, object]:
+    return {
+        "ok": returncode == 0 and error is None,
+        "provider": claims["provider"],
+        "mode": claims["mode"],
+        "slot_id": claims["slot_id"],
+        "slot_uid": slot_uid,
+        "config_dir": str(config_dir),
+        "ws_cwd": str(ws_cwd),
+        "text": text,
+        "usage": dict(usage),
+        "session_id": session_id,
+        "model": model,
+        "duration_ms": duration_ms,
+        "returncode": returncode,
+        "error": error,
+        "secret_env_present": sorted(key for key in SECRET_ENV_KEYS if key in env),
+    }
 
 
 @app.get("/wd/health")
@@ -109,7 +473,7 @@ async def run(
     try:
         claims = verify_claim(x_wd_claim, CLAIM_SECRET, body=body)
         if claims["mode"] != "A":
-            raise WDClaimError("Stage 0 supports mode A only")
+            raise WDClaimError("Stage 1 supports mode A only")
         config_dir, ws_cwd = validate_claim_paths(claims)
         slot_uid = get_or_allocate_uid(str(claims["slot_id"]))
         prepare_slot_dirs(str(claims["slot_id"]), config_dir, ws_cwd, slot_uid)
@@ -118,47 +482,70 @@ async def run(
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"slot dir preparation failed: {exc}") from exc
 
-    argv = _argv_from_body(body)
-    env = _child_env()
-    timeout = int(body.get("timeout") or min(TIMEOUT, 30))
+    prompt, model, system_prompt, resume, timeout = _run_body(body)
     started = time.time()
     try:
-        result = subprocess.run(
-            argv,
-            capture_output=True,
-            text=True,
+        result, text, usage, session_id, actual_model, _argv, env = _execute_provider(
+            provider=str(claims["provider"]),
+            prompt=prompt,
+            model=model,
+            system_prompt=system_prompt,
+            resume=resume,
+            tools_allowed=bool(claims["tools_allowed"]),
             timeout=timeout,
-            cwd=str(ws_cwd),
-            env=env,
-            user=slot_uid,
-            group=slot_uid,
-            extra_groups=[],
-            start_new_session=True,
+            config_dir=config_dir,
+            ws_cwd=ws_cwd,
+            slot_uid=slot_uid,
         )
     except subprocess.TimeoutExpired as exc:
-        raise HTTPException(status_code=504, detail="command timeout") from exc
+        env = _provider_env(str(claims["provider"]), config_dir, ws_cwd)
+        return _run_response(
+            claims=claims,
+            slot_uid=slot_uid,
+            config_dir=config_dir,
+            ws_cwd=ws_cwd,
+            text="",
+            usage={},
+            session_id=None,
+            model=model,
+            duration_ms=int((time.time() - started) * 1000),
+            returncode=-1,
+            error="CLI timeout",
+            env=env,
+        )
     except FileNotFoundError as exc:
-        raise HTTPException(status_code=500, detail="dummy command not found") from exc
+        env = _provider_env(str(claims["provider"]), config_dir, ws_cwd)
+        return _run_response(
+            claims=claims,
+            slot_uid=slot_uid,
+            config_dir=config_dir,
+            ws_cwd=ws_cwd,
+            text="",
+            usage={},
+            session_id=None,
+            model=model,
+            duration_ms=int((time.time() - started) * 1000),
+            returncode=-1,
+            error=_mask_secrets(str(exc)),
+            env=env,
+        )
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"setuid command failed: {exc}") from exc
 
-    forbidden_env_present = sorted(key for key in SECRET_ENV_KEYS if key in env)
-    return {
-        "ok": result.returncode == 0,
-        "provider": claims["provider"],
-        "mode": claims["mode"],
-        "slot_id": claims["slot_id"],
-        "slot_uid": slot_uid,
-        "gid": slot_uid,
-        "config_dir": str(config_dir),
-        "ws_cwd": str(ws_cwd),
-        "argv": argv,
-        "returncode": result.returncode,
-        "stdout": result.stdout,
-        "stderr": result.stderr,
-        "duration_ms": int((time.time() - started) * 1000),
-        "secret_env_present": forbidden_env_present,
-    }
+    return _run_response(
+        claims=claims,
+        slot_uid=slot_uid,
+        config_dir=config_dir,
+        ws_cwd=ws_cwd,
+        text=text,
+        usage=usage,
+        session_id=session_id,
+        model=actual_model,
+        duration_ms=int((time.time() - started) * 1000),
+        returncode=result.returncode,
+        error=_error_from_result(result),
+        env=env,
+    )
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "DELETE", "PUT", "PATCH"])

@@ -69,7 +69,7 @@ print(seg + "." + sig)
 PY
 }
 
-body='{"command":"id","args":["-u"]}'
+body='{"prompt":"Return only: wd-smoke"}'
 slot="33333333-3333-4333-8333-333333333333"
 chat="44444444-4444-4444-8444-444444444444"
 token="$(claim "$slot" "$chat" "jti-smoke-a")"
@@ -88,7 +88,7 @@ pass "forged signature rejected"
 pass "jti replay rejected"
 
 token_b="$(claim "$slot" "$chat" "jti-smoke-b")"
-[[ "$(code POST "$WD_URL/wd/v1/run" "$API_KEY" "$token_b" '{"command":"echo","args":["mutated"]}')" == "403" ]] || fail "body mutation rejected"
+[[ "$(code POST "$WD_URL/wd/v1/run" "$API_KEY" "$token_b" '{"prompt":"mutated"}')" == "403" ]] || fail "body mutation rejected"
 pass "body mutation rejected"
 
 token_c="$(claim "$slot" "$chat" "jti-smoke-c" "$body" expired)"
@@ -99,7 +99,7 @@ token_d="$(claim "$slot" "$chat" "jti-smoke-d" "$body" nested_config)"
 [[ "$(code POST "$WD_URL/wd/v1/run" "$API_KEY" "$token_d" "$body")" == "403" ]] || fail "nested config_dir rejected"
 pass "nested config_dir rejected"
 
-body_with_config='{"command":"id","args":["-u"],"config_dir":"/root/.claude"}'
+body_with_config='{"prompt":"Return only: wd-smoke","config_dir":"/root/.claude"}'
 token_e="$(claim "$slot" "$chat" "jti-smoke-e" "$body_with_config")"
 [[ "$(code POST "$WD_URL/wd/v1/run" "$API_KEY" "$token_e" "$body_with_config")" == "200" ]] || fail "body config_dir ignored"
 pass "body config_dir ignored"
