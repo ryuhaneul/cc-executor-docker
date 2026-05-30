@@ -911,6 +911,7 @@ def _write_credentials(creds: dict, claude_config_dir=None) -> tuple[bool, str]:
 
 def _claude_auth_status(claude_config_dir=None):
     """Return dict parsed from `claude auth status` JSON, or {}."""
+    status = {}
     try:
         env, _ = _claude_env(claude_config_dir)
         out = subprocess.run(
@@ -919,10 +920,52 @@ def _claude_auth_status(claude_config_dir=None):
         )
         m = re.search(r"\{.*?\}", out.stdout, re.DOTALL)
         if m:
-            return json.loads(m.group(0))
+            status = json.loads(m.group(0))
     except Exception:
         pass
-    return {}
+    try:
+        _, config_dir = _claude_env(claude_config_dir)
+        with open(os.path.join(config_dir, ".credentials.json"), "r", encoding="utf-8") as fh:
+            creds = json.load(fh)
+        oauth = creds.get("claudeAiOauth") if isinstance(creds, dict) else None
+        expires_at = oauth.get("expiresAt") if isinstance(oauth, dict) else None
+        expires_at = int(expires_at) if expires_at is not None else None
+    except Exception:
+        expires_at = None
+    status["expiresAt"] = expires_at
+    status["expired"] = (int(time.time() * 1000) > expires_at) if expires_at is not None else None
+    return status
+
+
+def _decode_jwt_payload(token):
+    try:
+        parts = str(token or "").split(".")
+        if len(parts) < 2:
+            return None
+        payload = parts[1]
+        payload += "=" * (-len(payload) % 4)
+        decoded = base64.urlsafe_b64decode(payload.encode("ascii")).decode("utf-8")
+        data = json.loads(decoded)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _codex_auth_expiry(config_dir):
+    try:
+        with open(os.path.join(config_dir, "auth.json"), "r", encoding="utf-8") as fh:
+            auth = json.load(fh)
+        tokens = auth.get("tokens") if isinstance(auth, dict) else None
+        if not isinstance(tokens, dict):
+            return None, None
+        payload = _decode_jwt_payload(tokens.get("access_token") or tokens.get("id_token"))
+        exp = payload.get("exp") if isinstance(payload, dict) else None
+        if exp is None:
+            return None, None
+        expires_at = int(exp) * 1000
+        return expires_at, int(time.time() * 1000) > expires_at
+    except Exception:
+        return None, None
 
 
 def _codex_cli_available():
@@ -1062,6 +1105,8 @@ class Handler(BaseHTTPRequestHandler):
                 "loggedIn": bool(status.get("loggedIn")),
                 "authMethod": status.get("authMethod"),
                 "apiProvider": status.get("apiProvider"),
+                "expiresAt": status.get("expiresAt"),
+                "expired": status.get("expired"),
             })
         elif self.path == "/admin/codex/status":
             if not self._check_auth():
@@ -1080,11 +1125,14 @@ class Handler(BaseHTTPRequestHandler):
             elif _codex_auth_json_logged_in(config_dir):
                 auth_method = "auth_json"
                 logged_in = True
+            expires_at, expired = _codex_auth_expiry(config_dir)
             self._json_response(200, {
                 "loggedIn": logged_in,
                 "authMethod": auth_method,
                 "codexHome": config_dir,
                 "cliAvailable": cli_available,
+                "expiresAt": expires_at,
+                "expired": expired,
             })
         else:
             self.send_error(404)
