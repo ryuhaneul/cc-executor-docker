@@ -220,9 +220,10 @@ def _resolve_codex_model(model_name, codex_config_dir):
     return slug, meta
 
 
-def _codex_model_entries(codex_config_dir=None):
+def _codex_model_entries(codex_config_dir=None, force_static=False):
     entries = []
     seen = set()
+    models = _static_codex_models() if force_static else _load_codex_models(codex_config_dir)
 
     def add(entry):
         if entry["id"] in seen:
@@ -230,7 +231,7 @@ def _codex_model_entries(codex_config_dir=None):
         seen.add(entry["id"])
         entries.append(entry)
 
-    for model in _load_codex_models(codex_config_dir):
+    for model in models:
         slug = model["slug"]
         add({
             "id": f"codex/{slug}",
@@ -242,7 +243,7 @@ def _codex_model_entries(codex_config_dir=None):
             "default_effort": model.get("default_effort"),
         })
     for alias_id, slug in CODEX_MODEL_MAP.items():
-        meta = next((m for m in _load_codex_models(codex_config_dir) if m["slug"] == slug), None)
+        meta = next((m for m in models if m["slug"] == slug), None)
         if meta is None:
             meta = {
                 "slug": slug,
@@ -1029,10 +1030,14 @@ class Handler(BaseHTTPRequestHandler):
                 self._json_response(401, {"error": {"message": "Invalid API key", "type": "authentication_error"}})
                 return
             requested_codex_dir = self.headers.get("X-Codex-Config-Dir", "")
-            codex_config_dir = _valid_codex_config_dir(requested_codex_dir) if requested_codex_dir else DEFAULT_CODEX_CONFIG_DIR
-            if not codex_config_dir:
-                self._json_response(400, {"error": {"message": "invalid CODEX_HOME"}})
-                return
+            if requested_codex_dir:
+                codex_config_dir = _valid_codex_config_dir(requested_codex_dir)
+                if not codex_config_dir:
+                    self._json_response(400, {"error": {"message": "invalid CODEX_HOME"}})
+                    return
+                codex_models = _codex_model_entries(codex_config_dir)
+            else:
+                codex_models = _codex_model_entries(force_static=True)
             claude_models = [
                 {
                     **m,
@@ -1043,7 +1048,7 @@ class Handler(BaseHTTPRequestHandler):
             ]
             self._json_response(200, {
                 "object": "list",
-                "data": claude_models + _codex_model_entries(codex_config_dir),
+                "data": claude_models + codex_models,
             })
         elif self.path == "/admin/status":
             if not self._check_auth():
