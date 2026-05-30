@@ -562,7 +562,7 @@ def _run_codex(cli_model, prompt, system_prompt=None, cwd=None, timeout=None, ad
         if effort:
             cmd += ["-c", f"model_reasoning_effort={effort}"]
         if web_search:
-            cmd.append("--search")
+            cmd += ["-c", "tools.web_search=true"]
         cmd.append("-")
 
         print(f"[DEBUG] cmd={' '.join(cmd)} cwd={effective_cwd} timeout={effective_timeout}",
