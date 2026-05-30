@@ -444,7 +444,7 @@ def _cleanup_session_file(session_id, cwd=None, claude_config_dir=None):
 
 def _run_claude(cli_model, prompt, system_prompt=None, max_turns=None, allowed_tools=None,
                 cwd=None, dangerously_skip_permissions=False, timeout=None, add_dirs=None,
-                claude_config_dir=None, effort=None):
+                claude_config_dir=None, effort=None, web_search=False):
     """Run claude CLI with a resolved CLI model name (e.g. 'opus[1m]' or 'opus')."""
     session_id = str(uuid.uuid4())
     cmd = ["claude", "--print", "--setting-sources", "", "--session-id", session_id]
@@ -457,6 +457,15 @@ def _run_claude(cli_model, prompt, system_prompt=None, max_turns=None, allowed_t
         cmd += ["--system-prompt", system_prompt]
     if effort:
         cmd += ["--effort", effort]
+    if web_search:
+        allowed = []
+        for tool in allowed_tools or []:
+            if tool not in allowed:
+                allowed.append(tool)
+        for tool in ("WebSearch", "WebFetch"):
+            if tool not in allowed:
+                allowed.append(tool)
+        allowed_tools = allowed
     if allowed_tools:
         for tool in allowed_tools:
             cmd += ["--allowedTools", tool]
@@ -508,7 +517,7 @@ def _run_claude(cli_model, prompt, system_prompt=None, max_turns=None, allowed_t
 
 
 def _run_codex(cli_model, prompt, system_prompt=None, cwd=None, timeout=None, add_dirs=None,
-               sandbox="read-only", codex_config_dir=None, effort=None):
+               sandbox="read-only", codex_config_dir=None, effort=None, web_search=False):
     """Run codex CLI with stdin prompt and return its last-message output."""
     effective_cwd = cwd or WORKDIR
     effective_timeout = timeout if timeout is not None else TIMEOUT
@@ -552,6 +561,8 @@ def _run_codex(cli_model, prompt, system_prompt=None, cwd=None, timeout=None, ad
                 cmd += ["--add-dir", d]
         if effort:
             cmd += ["-c", f"model_reasoning_effort={effort}"]
+        if web_search:
+            cmd.append("--search")
         cmd.append("-")
 
         print(f"[DEBUG] cmd={' '.join(cmd)} cwd={effective_cwd} timeout={effective_timeout}",
@@ -595,7 +606,7 @@ def _run_codex(cli_model, prompt, system_prompt=None, cwd=None, timeout=None, ad
 
 def _run_claude_with_retry(model, prompt, system_prompt=None, max_turns=None, allowed_tools=None,
                             cwd=None, dangerously_skip_permissions=False, timeout=None,
-                            add_dirs=None, claude_config_dir=None, effort=None):
+                            add_dirs=None, claude_config_dir=None, effort=None, web_search=False):
     """Resolve model alias, run once, retry once after a short delay, and
     fall back from 1M (`foo[1m]`) to the 200K variant (`foo`) if still failing.
 
@@ -613,6 +624,7 @@ def _run_claude_with_retry(model, prompt, system_prompt=None, max_turns=None, al
         add_dirs=add_dirs,
         claude_config_dir=claude_config_dir,
         effort=effort,
+        web_search=web_search,
     )
 
     ok, output, error = _run_claude(resolved, prompt, **kwargs)
@@ -1602,6 +1614,7 @@ class Handler(BaseHTTPRequestHandler):
         body_cwd = body.get("cwd")
         body_add_dirs = body.get("add_dirs") or []
         reasoning_effort = _normalize_reasoning_effort(body.get("reasoning_effort"))
+        web_search = bool(body.get("web_search", False))
 
         if not messages:
             self._json_response(400, {"error": {"message": "messages is required", "type": "invalid_request_error"}})
@@ -1652,6 +1665,7 @@ class Handler(BaseHTTPRequestHandler):
                 request_timeout=request_timeout,
                 body_cwd=body_cwd,
                 body_add_dirs=body_add_dirs,
+                web_search=web_search,
             )
             return
 
@@ -1729,6 +1743,7 @@ class Handler(BaseHTTPRequestHandler):
                 add_dirs=add_dirs,
                 claude_config_dir=config_dir,
                 effort=reasoning_effort,
+                web_search=web_search,
             )
 
             if not ok:
@@ -1783,7 +1798,7 @@ class Handler(BaseHTTPRequestHandler):
                           file=sys.stderr)
 
     def _handle_codex_chat(self, body, model, cli_model, prompt, system_prompt,
-                           output_files_mode, request_timeout, body_cwd, body_add_dirs):
+                           output_files_mode, request_timeout, body_cwd, body_add_dirs, web_search=False):
         config_dir = self._codex_config_dir_from_request(body)
         if not config_dir:
             return
@@ -1869,6 +1884,7 @@ class Handler(BaseHTTPRequestHandler):
                 sandbox=sandbox,
                 codex_config_dir=config_dir,
                 effort=reasoning_effort,
+                web_search=web_search,
             )
 
             if not ok:
