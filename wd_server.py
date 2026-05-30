@@ -173,8 +173,6 @@ def _build_codex_argv(
         "--skip-git-repo-check",
         "--output-last-message",
         str(last_message_path),
-        "--ask-for-approval",
-        "never",
         "--color",
         "never",
     ]
