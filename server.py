@@ -132,11 +132,140 @@ CODEX_MODEL_MAP = {
     "codex/default": CODEX_DEFAULT_MODEL,
     "codex/gpt-5.5": "gpt-5.5",
 }
+CLAUDE_SUPPORTED_EFFORTS = ["low", "medium", "high", "xhigh", "max"]
+CODEX_SUPPORTED_EFFORTS = ["low", "medium", "high", "xhigh"]
+_DEFAULT_CODEX_STATIC_MODEL_IDS = [
+    "gpt-5.5",
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.3-codex",
+    "gpt-5.3-codex-spark",
+    "gpt-5.2",
+]
+CODEX_STATIC_MODEL_IDS = [
+    m.strip()
+    for m in os.environ.get("CODEX_STATIC_MODELS", ",".join(_DEFAULT_CODEX_STATIC_MODEL_IDS)).split(",")
+    if m.strip()
+]
 
 CODEX_AVAILABLE_MODELS = [
     {"id": "codex/default", "object": "model", "created": 1700000000, "owned_by": "openai"},
     {"id": "codex/gpt-5.5", "object": "model", "created": 1700000000, "owned_by": "openai"},
 ]
+
+
+def _static_codex_models():
+    out = []
+    for slug in CODEX_STATIC_MODEL_IDS:
+        out.append({
+            "slug": slug,
+            "supported_efforts": list(CODEX_SUPPORTED_EFFORTS),
+            "default_effort": "high" if slug == "gpt-5.3-codex-spark" else "medium",
+        })
+    return out
+
+
+def _load_codex_models(codex_config_dir):
+    config_dir = _valid_codex_config_dir(codex_config_dir)
+    if not config_dir:
+        return _static_codex_models()
+    path = Path(config_dir) / "models_cache.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return _static_codex_models()
+    rows = data.get("models") if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+        return _static_codex_models()
+    out = []
+    for row in rows:
+        if not isinstance(row, dict) or row.get("visibility") != "list":
+            continue
+        slug = str(row.get("slug") or "").strip()
+        if not slug:
+            continue
+        levels = row.get("reasoning_levels") or row.get("supported_reasoning_levels") or []
+        efforts = []
+        if isinstance(levels, list):
+            for level in levels:
+                if isinstance(level, dict):
+                    effort = str(level.get("effort") or "").strip()
+                    if effort:
+                        efforts.append(effort)
+        efforts = [e for e in dict.fromkeys(efforts) if e]
+        if not efforts:
+            efforts = list(CODEX_SUPPORTED_EFFORTS)
+        default_effort = row.get("default_reasoning_level")
+        default_effort = str(default_effort).strip() if default_effort else None
+        out.append({
+            "slug": slug,
+            "supported_efforts": efforts,
+            "default_effort": default_effort,
+        })
+    return out or _static_codex_models()
+
+
+def _resolve_codex_model(model_name, codex_config_dir):
+    name = str(model_name or "codex/default")
+    if name in CODEX_MODEL_MAP:
+        slug = CODEX_MODEL_MAP[name]
+    elif name.startswith("codex/"):
+        slug = name.split("/", 1)[1]
+    else:
+        slug = name
+    by_slug = {m["slug"]: m for m in _load_codex_models(codex_config_dir)}
+    meta = by_slug.get(slug)
+    if not meta:
+        raise ValueError(f"unsupported Codex model: {name}")
+    return slug, meta
+
+
+def _codex_model_entries(codex_config_dir=None):
+    entries = []
+    seen = set()
+
+    def add(entry):
+        if entry["id"] in seen:
+            return
+        seen.add(entry["id"])
+        entries.append(entry)
+
+    for model in _load_codex_models(codex_config_dir):
+        slug = model["slug"]
+        add({
+            "id": f"codex/{slug}",
+            "object": "model",
+            "created": 1700000000,
+            "owned_by": "openai",
+            "slug": slug,
+            "supported_efforts": list(model.get("supported_efforts") or []),
+            "default_effort": model.get("default_effort"),
+        })
+    for alias_id, slug in CODEX_MODEL_MAP.items():
+        meta = next((m for m in _load_codex_models(codex_config_dir) if m["slug"] == slug), None)
+        if meta is None:
+            meta = {
+                "slug": slug,
+                "supported_efforts": list(CODEX_SUPPORTED_EFFORTS),
+                "default_effort": "medium",
+            }
+        add({
+            "id": alias_id,
+            "object": "model",
+            "created": 1700000000,
+            "owned_by": "openai",
+            "slug": slug,
+            "supported_efforts": list(meta.get("supported_efforts") or []),
+            "default_effort": meta.get("default_effort"),
+        })
+    return entries
+
+
+def _normalize_reasoning_effort(value):
+    if value is None:
+        return None
+    effort = str(value).strip()
+    return effort or None
 
 
 def _valid_claude_config_dir(path):
@@ -280,14 +409,7 @@ def _resolve_provider_and_model(body):
             "message": "Claude model aliases require provider=claude",
             "type": "invalid_request_error",
         }
-    if model_name in CODEX_MODEL_MAP:
-        return provider, CODEX_MODEL_MAP[model_name], None
-    if model_name in CODEX_MODEL_MAP.values():
-        return provider, model_name, None
-    return None, None, {
-        "message": f"unsupported Codex model: {model_name}",
-        "type": "invalid_request_error",
-    }
+    return provider, model_name, None
 
 
 def _cleanup_session_file(session_id, cwd=None, claude_config_dir=None):
@@ -321,7 +443,7 @@ def _cleanup_session_file(session_id, cwd=None, claude_config_dir=None):
 
 def _run_claude(cli_model, prompt, system_prompt=None, max_turns=None, allowed_tools=None,
                 cwd=None, dangerously_skip_permissions=False, timeout=None, add_dirs=None,
-                claude_config_dir=None):
+                claude_config_dir=None, effort=None):
     """Run claude CLI with a resolved CLI model name (e.g. 'opus[1m]' or 'opus')."""
     session_id = str(uuid.uuid4())
     cmd = ["claude", "--print", "--setting-sources", "", "--session-id", session_id]
@@ -332,6 +454,8 @@ def _run_claude(cli_model, prompt, system_prompt=None, max_turns=None, allowed_t
         cmd += ["--max-turns", str(max_turns)]
     if system_prompt:
         cmd += ["--system-prompt", system_prompt]
+    if effort:
+        cmd += ["--effort", effort]
     if allowed_tools:
         for tool in allowed_tools:
             cmd += ["--allowedTools", tool]
@@ -383,7 +507,7 @@ def _run_claude(cli_model, prompt, system_prompt=None, max_turns=None, allowed_t
 
 
 def _run_codex(cli_model, prompt, system_prompt=None, cwd=None, timeout=None, add_dirs=None,
-               sandbox="read-only", codex_config_dir=None):
+               sandbox="read-only", codex_config_dir=None, effort=None):
     """Run codex CLI with stdin prompt and return its last-message output."""
     effective_cwd = cwd or WORKDIR
     effective_timeout = timeout if timeout is not None else TIMEOUT
@@ -425,6 +549,8 @@ def _run_codex(cli_model, prompt, system_prompt=None, cwd=None, timeout=None, ad
         if add_dirs:
             for d in add_dirs:
                 cmd += ["--add-dir", d]
+        if effort:
+            cmd += ["-c", f"model_reasoning_effort={effort}"]
         cmd.append("-")
 
         print(f"[DEBUG] cmd={' '.join(cmd)} cwd={effective_cwd} timeout={effective_timeout}",
@@ -468,7 +594,7 @@ def _run_codex(cli_model, prompt, system_prompt=None, cwd=None, timeout=None, ad
 
 def _run_claude_with_retry(model, prompt, system_prompt=None, max_turns=None, allowed_tools=None,
                             cwd=None, dangerously_skip_permissions=False, timeout=None,
-                            add_dirs=None, claude_config_dir=None):
+                            add_dirs=None, claude_config_dir=None, effort=None):
     """Resolve model alias, run once, retry once after a short delay, and
     fall back from 1M (`foo[1m]`) to the 200K variant (`foo`) if still failing.
 
@@ -485,6 +611,7 @@ def _run_claude_with_retry(model, prompt, system_prompt=None, max_turns=None, al
         timeout=timeout,
         add_dirs=add_dirs,
         claude_config_dir=claude_config_dir,
+        effort=effort,
     )
 
     ok, output, error = _run_claude(resolved, prompt, **kwargs)
@@ -901,9 +1028,22 @@ class Handler(BaseHTTPRequestHandler):
             if not self._check_auth():
                 self._json_response(401, {"error": {"message": "Invalid API key", "type": "authentication_error"}})
                 return
+            requested_codex_dir = self.headers.get("X-Codex-Config-Dir", "")
+            codex_config_dir = _valid_codex_config_dir(requested_codex_dir) if requested_codex_dir else DEFAULT_CODEX_CONFIG_DIR
+            if not codex_config_dir:
+                self._json_response(400, {"error": {"message": "invalid CODEX_HOME"}})
+                return
+            claude_models = [
+                {
+                    **m,
+                    "supported_efforts": list(CLAUDE_SUPPORTED_EFFORTS),
+                    "default_effort": None,
+                }
+                for m in CLAUDE_AVAILABLE_MODELS
+            ]
             self._json_response(200, {
                 "object": "list",
-                "data": CLAUDE_AVAILABLE_MODELS + CODEX_AVAILABLE_MODELS,
+                "data": claude_models + _codex_model_entries(codex_config_dir),
             })
         elif self.path == "/admin/status":
             if not self._check_auth():
@@ -1408,6 +1548,7 @@ class Handler(BaseHTTPRequestHandler):
         body_allowed_tools = body.get("allowed_tools")
         body_cwd = body.get("cwd")
         body_add_dirs = body.get("add_dirs") or []
+        reasoning_effort = _normalize_reasoning_effort(body.get("reasoning_effort"))
 
         if not messages:
             self._json_response(400, {"error": {"message": "messages is required", "type": "invalid_request_error"}})
@@ -1463,6 +1604,14 @@ class Handler(BaseHTTPRequestHandler):
 
         config_dir = self._claude_config_dir_from_request(body)
         if not config_dir:
+            return
+        if reasoning_effort and reasoning_effort not in CLAUDE_SUPPORTED_EFFORTS:
+            self._json_response(400, {
+                "error": {
+                    "message": f"unsupported reasoning_effort for provider=claude: {reasoning_effort}",
+                    "type": "invalid_request_error",
+                }
+            })
             return
 
         # Three modes:
@@ -1526,6 +1675,7 @@ class Handler(BaseHTTPRequestHandler):
                 timeout=request_timeout,
                 add_dirs=add_dirs,
                 claude_config_dir=config_dir,
+                effort=reasoning_effort,
             )
 
             if not ok:
@@ -1593,6 +1743,25 @@ class Handler(BaseHTTPRequestHandler):
                 }
             })
             return
+        try:
+            cli_model, model_meta = _resolve_codex_model(model, config_dir)
+        except ValueError as exc:
+            self._json_response(400, {
+                "error": {
+                    "message": str(exc),
+                    "type": "invalid_request_error",
+                }
+            })
+            return
+        reasoning_effort = _normalize_reasoning_effort(body.get("reasoning_effort"))
+        if reasoning_effort and reasoning_effort not in (model_meta.get("supported_efforts") or []):
+            self._json_response(400, {
+                "error": {
+                    "message": f"unsupported reasoning_effort for model {model}: {reasoning_effort}",
+                    "type": "invalid_request_error",
+                }
+            })
+            return
 
         requested_sandbox = body.get("codex_sandbox")
         if requested_sandbox is not None:
@@ -1646,6 +1815,7 @@ class Handler(BaseHTTPRequestHandler):
                 add_dirs=add_dirs,
                 sandbox=sandbox,
                 codex_config_dir=config_dir,
+                effort=reasoning_effort,
             )
 
             if not ok:
