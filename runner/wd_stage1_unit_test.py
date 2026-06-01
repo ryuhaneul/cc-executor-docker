@@ -326,7 +326,12 @@ def test_login_complete_binding_mismatch_rejected() -> None:
         "requester_id": str(uuid.uuid4()),
         "provider": "claude",
     }
-    session = {**claims, "config_dir": "/data/auth/claude/users/x", "slot_uid": 20000}
+    session = {
+        **claims,
+        "config_dir": "/data/auth/claude/users/x",
+        "slot_uid": 20000,
+        "expires_at": time.time() + 60,
+    }
     changed = dict(claims)
     changed["tenant_id"] = str(uuid.uuid4())
     login_id = str(uuid.uuid4())
