@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time
 import urllib.request
+import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -50,8 +51,16 @@ def request_json(method: str, url: str, body: dict[str, object] | None = None) -
             "Content-Type": "application/json",
         },
     )
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        return resp.status, json.loads(resp.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        try:
+            body = json.loads(raw)
+        except json.JSONDecodeError:
+            body = {"error": raw}
+        return exc.code, body
 
 
 def wait_ready(base_url: str) -> None:
@@ -118,7 +127,7 @@ def main() -> None:
                 f"{base_url}/admin/oauth/complete",
                 {"session_id": session_id, "code": f"legacy-code#{state}"},
             )
-            assert status == 200
+            assert status == 200, completed
             assert completed["ok"] is True
 
             status, codex = request_json("POST", f"{base_url}/admin/codex/login/start", {})
