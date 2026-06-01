@@ -134,7 +134,9 @@ def _append_common_claude_args(
         argv += ["--system-prompt", system_prompt]
     if resume:
         argv += ["--resume", resume]
-    if not tools_allowed:
+    if tools_allowed:
+        argv += ["--permission-mode", "bypassPermissions"]
+    else:
         argv += ["--disallowedTools", "*"]
 
 
@@ -164,29 +166,40 @@ def _build_codex_argv(
     resume: str | None,
     tools_allowed: bool,
 ) -> list[str]:
-    argv = [
-        "codex",
-        "exec",
-        "--json",
-        "-C",
-        str(ws_cwd),
-        "--skip-git-repo-check",
-        "--output-last-message",
-        str(last_message_path),
-        "--color",
-        "never",
-    ]
+    sandbox = "workspace-write" if tools_allowed else "read-only"
+    if resume:
+        argv = [
+            "codex",
+            "-C",
+            str(ws_cwd),
+            "--sandbox",
+            sandbox,
+            "exec",
+            "resume",
+            "--json",
+            "--skip-git-repo-check",
+            "--output-last-message",
+            str(last_message_path),
+        ]
+    else:
+        argv = [
+            "codex",
+            "exec",
+            "--json",
+            "-C",
+            str(ws_cwd),
+            "--skip-git-repo-check",
+            "--output-last-message",
+            str(last_message_path),
+            "--color",
+            "never",
+            "--sandbox",
+            sandbox,
+        ]
     if model:
         argv += ["-m", model]
-    if tools_allowed:
-        argv += ["--sandbox", "workspace-write"]
-    else:
-        # Codex has no Stage 1 claim-aware tool ACL. Read-only sandbox plus
-        # never-approval is the conservative non-mutating mapping.
-        argv += ["--sandbox", "read-only"]
     if resume:
-        argv += ["resume", resume]
-    argv.append("-")
+        argv.append(resume)
     return argv
 
 

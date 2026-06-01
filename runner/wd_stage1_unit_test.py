@@ -57,6 +57,28 @@ def test_codex_parser() -> None:
     assert model is None
 
 
+def test_claude_tools_argv_branches() -> None:
+    tool_free = wd_server._build_claude_argv(
+        model=None,
+        system_prompt=None,
+        resume=None,
+        tools_allowed=False,
+    )
+    tool_enabled = wd_server._build_claude_argv(
+        model=None,
+        system_prompt=None,
+        resume=None,
+        tools_allowed=True,
+    )
+
+    assert "--disallowedTools" in tool_free
+    assert "*" in tool_free
+    assert "--permission-mode" not in tool_free
+    assert "--permission-mode" in tool_enabled
+    assert "bypassPermissions" in tool_enabled
+    assert "--disallowedTools" not in tool_enabled
+
+
 def test_execute_provider_uses_slot_identity_and_env() -> None:
     original = wd_server.subprocess.run
     calls: list[dict[str, object]] = []
@@ -113,6 +135,20 @@ def test_execute_provider_uses_slot_identity_and_env() -> None:
     assert call["start_new_session"] is True
 
 
+def test_codex_non_resume_argv_has_no_literal_stdin_prompt() -> None:
+    argv = wd_server._build_codex_argv(
+        model="gpt-5-codex",
+        ws_cwd=Path("/tmp/ws"),
+        last_message_path=Path("/tmp/ws/.wd-codex-last-test.txt"),
+        resume=None,
+        tools_allowed=False,
+    )
+
+    assert argv[:2] == ["codex", "exec"]
+    assert "resume" not in argv
+    assert "-" not in argv
+
+
 def test_codex_argv_env_and_last_message_file() -> None:
     original = wd_server.subprocess.run
     calls: list[dict[str, object]] = []
@@ -159,8 +195,10 @@ def test_codex_argv_env_and_last_message_file() -> None:
     assert env["TMPDIR"] == str(ws_cwd)
     assert "--sandbox" in argv
     assert "read-only" in argv
-    assert "resume" in argv
-    assert "thread-old" in argv
+    exec_index = argv.index("exec")
+    assert argv[exec_index + 1] == "resume"
+    assert argv[-1] == "thread-old"
+    assert "-" not in argv
     assert not any(key in env for key in wd_server.SECRET_ENV_KEYS)
     call = calls[-1]
     assert call["cwd"] == str(ws_cwd)
@@ -171,6 +209,8 @@ def test_codex_argv_env_and_last_message_file() -> None:
 if __name__ == "__main__":
     test_claude_parser()
     test_codex_parser()
+    test_claude_tools_argv_branches()
     test_execute_provider_uses_slot_identity_and_env()
+    test_codex_non_resume_argv_has_no_literal_stdin_prompt()
     test_codex_argv_env_and_last_message_file()
     print("PASS wd_stage1_unit_test")
