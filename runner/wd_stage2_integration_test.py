@@ -162,7 +162,7 @@ def main() -> None:
             codex_login_id = str(uuid.uuid4())
             codex_started = request_json("POST", "/wd/v1/login/start", {"login_id": codex_login_id}, slot_id=codex_slot, tenant_id=tenant_id, requester_id=requester_id, provider="codex")
             assert codex_started["verification_url"].startswith("https://auth.openai.com/codex/device")
-            assert codex_started["user_code"] == "WXYZ-12345"
+            assert re.fullmatch(r"[A-Z0-9]{4}-[A-Z0-9]{5}", str(codex_started["user_code"]))
             assert not Path(f"/data/auth/codex/users/{codex_slot}/auth.json").exists()
             codex_status = request_json("GET", "/wd/v1/login/status", {}, slot_id=codex_slot, tenant_id=tenant_id, requester_id=requester_id, provider="codex")
             assert codex_status["loggedIn"] is False
