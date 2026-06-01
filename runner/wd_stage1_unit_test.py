@@ -11,10 +11,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import wd_server
 
 
-def _completed(stdout: str, returncode: int = 0) -> subprocess.CompletedProcess[str]:
-    return subprocess.CompletedProcess(["fake"], returncode, stdout=stdout, stderr="")
-
-
 def test_claude_parser() -> None:
     stdout = json.dumps(
         {
@@ -57,36 +53,55 @@ def test_codex_parser() -> None:
     assert model is None
 
 
-def test_claude_tools_argv_branches() -> None:
+class FakeProc:
+    def __init__(self, stdout: str = "", stderr: str = "", returncode: int = 0) -> None:
+        self.pid = 4242
+        self.stdout = stdout
+        self.stderr = stderr
+        self.returncode = returncode
+        self.waited = False
+
+    def communicate(self, input: str | None = None, timeout: int | None = None) -> tuple[str, str]:
+        return self.stdout, self.stderr
+
+    def wait(self) -> int:
+        self.waited = True
+        return self.returncode
+
+
+class TimeoutProc(FakeProc):
+    def communicate(self, input: str | None = None, timeout: int | None = None) -> tuple[str, str]:
+        raise subprocess.TimeoutExpired(["fake"], timeout)
+
+
+def test_claude_tools_false_argv_and_true_reject() -> None:
     tool_free = wd_server._build_claude_argv(
         model=None,
         system_prompt=None,
         resume=None,
         tools_allowed=False,
     )
-    tool_enabled = wd_server._build_claude_argv(
-        model=None,
-        system_prompt=None,
-        resume=None,
-        tools_allowed=True,
-    )
 
     assert "--disallowedTools" in tool_free
     assert "*" in tool_free
     assert "--permission-mode" not in tool_free
-    assert "--permission-mode" in tool_enabled
-    assert "bypassPermissions" in tool_enabled
-    assert "--disallowedTools" not in tool_enabled
+    try:
+        wd_server._reject_unsupported_tools({"tools_allowed": True})
+    except wd_server.HTTPException as exc:
+        assert exc.status_code == 403
+        assert exc.detail == "tools not supported until isolation sandbox lands (later stage)"
+    else:
+        raise AssertionError("tools_allowed=True must be rejected")
 
 
 def test_execute_provider_uses_slot_identity_and_env() -> None:
-    original = wd_server.subprocess.run
+    original = wd_server.subprocess.Popen
     calls: list[dict[str, object]] = []
 
-    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+    def fake_popen(argv: list[str], **kwargs: object) -> FakeProc:
         calls.append({"argv": argv, **kwargs})
-        return _completed(
-            json.dumps(
+        return FakeProc(
+            stdout=json.dumps(
                 {
                     "result": "ok",
                     "session_id": "session-a",
@@ -96,7 +111,7 @@ def test_execute_provider_uses_slot_identity_and_env() -> None:
         )
 
     try:
-        wd_server.subprocess.run = fake_run  # type: ignore[assignment]
+        wd_server.subprocess.Popen = fake_popen  # type: ignore[assignment]
         with tempfile.TemporaryDirectory() as tmp:
             config_dir = Path(tmp) / "config"
             ws_cwd = Path(tmp) / "ws"
@@ -115,7 +130,7 @@ def test_execute_provider_uses_slot_identity_and_env() -> None:
                 slot_uid=23456,
             )
     finally:
-        wd_server.subprocess.run = original  # type: ignore[assignment]
+        wd_server.subprocess.Popen = original  # type: ignore[assignment]
 
     assert result.returncode == 0
     assert text == "ok"
@@ -133,6 +148,45 @@ def test_execute_provider_uses_slot_identity_and_env() -> None:
     assert call["group"] == 23456
     assert call["extra_groups"] == []
     assert call["start_new_session"] is True
+    assert call["stdin"] == wd_server.subprocess.PIPE
+    assert call["stdout"] == wd_server.subprocess.PIPE
+    assert call["stderr"] == wd_server.subprocess.PIPE
+
+
+def test_run_subprocess_timeout_kills_process_group() -> None:
+    original_popen = wd_server.subprocess.Popen
+    original_killpg = wd_server.os.killpg
+    proc = TimeoutProc()
+    kill_calls: list[tuple[int, int]] = []
+
+    def fake_popen(argv: list[str], **kwargs: object) -> TimeoutProc:
+        return proc
+
+    def fake_killpg(pid: int, sig: int) -> None:
+        kill_calls.append((pid, sig))
+
+    try:
+        wd_server.subprocess.Popen = fake_popen  # type: ignore[assignment]
+        wd_server.os.killpg = fake_killpg  # type: ignore[assignment]
+        try:
+            wd_server._run_subprocess(
+                ["fake"],
+                prompt="hello",
+                timeout=1,
+                cwd=Path("/tmp"),
+                env={},
+                slot_uid=23456,
+            )
+        except subprocess.TimeoutExpired:
+            pass
+        else:
+            raise AssertionError("timeout must raise TimeoutExpired")
+    finally:
+        wd_server.subprocess.Popen = original_popen  # type: ignore[assignment]
+        wd_server.os.killpg = original_killpg  # type: ignore[assignment]
+
+    assert kill_calls == [(4242, wd_server.signal.SIGKILL)]
+    assert proc.waited is True
 
 
 def test_codex_non_resume_argv_has_no_literal_stdin_prompt() -> None:
@@ -147,18 +201,25 @@ def test_codex_non_resume_argv_has_no_literal_stdin_prompt() -> None:
     assert argv[:2] == ["codex", "exec"]
     assert "resume" not in argv
     assert "-" not in argv
+    assert "workspace-write" not in wd_server._build_codex_argv(
+        model="gpt-5-codex",
+        ws_cwd=Path("/tmp/ws"),
+        last_message_path=Path("/tmp/ws/.wd-codex-last-test.txt"),
+        resume=None,
+        tools_allowed=True,
+    )
 
 
 def test_codex_argv_env_and_last_message_file() -> None:
-    original = wd_server.subprocess.run
+    original = wd_server.subprocess.Popen
     calls: list[dict[str, object]] = []
 
-    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+    def fake_popen(argv: list[str], **kwargs: object) -> FakeProc:
         calls.append({"argv": argv, **kwargs})
         last_message_path = Path(argv[argv.index("--output-last-message") + 1])
         last_message_path.write_text("from last message", encoding="utf-8")
-        return _completed(
-            "\n".join(
+        return FakeProc(
+            stdout="\n".join(
                 [
                     json.dumps({"type": "session.created", "thread_id": "thread-a"}),
                     json.dumps({"type": "turn.completed", "usage": {"input_tokens": 3}}),
@@ -167,7 +228,7 @@ def test_codex_argv_env_and_last_message_file() -> None:
         )
 
     try:
-        wd_server.subprocess.run = fake_run  # type: ignore[assignment]
+        wd_server.subprocess.Popen = fake_popen  # type: ignore[assignment]
         with tempfile.TemporaryDirectory() as tmp:
             config_dir = Path(tmp) / "config"
             ws_cwd = Path(tmp) / "ws"
@@ -186,7 +247,7 @@ def test_codex_argv_env_and_last_message_file() -> None:
                 slot_uid=23457,
             )
     finally:
-        wd_server.subprocess.run = original  # type: ignore[assignment]
+        wd_server.subprocess.Popen = original  # type: ignore[assignment]
 
     assert text == "from last message"
     assert usage["input_tokens"] == 3
@@ -209,8 +270,9 @@ def test_codex_argv_env_and_last_message_file() -> None:
 if __name__ == "__main__":
     test_claude_parser()
     test_codex_parser()
-    test_claude_tools_argv_branches()
+    test_claude_tools_false_argv_and_true_reject()
     test_execute_provider_uses_slot_identity_and_env()
+    test_run_subprocess_timeout_kills_process_group()
     test_codex_non_resume_argv_has_no_literal_stdin_prompt()
     test_codex_argv_env_and_last_message_file()
     print("PASS wd_stage1_unit_test")

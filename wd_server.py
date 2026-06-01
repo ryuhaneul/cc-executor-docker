@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-import os
 import json
+import os
 import re
+import signal
 import subprocess
 import time
 import uuid
@@ -134,10 +135,7 @@ def _append_common_claude_args(
         argv += ["--system-prompt", system_prompt]
     if resume:
         argv += ["--resume", resume]
-    if tools_allowed:
-        argv += ["--permission-mode", "bypassPermissions"]
-    else:
-        argv += ["--disallowedTools", "*"]
+    argv += ["--disallowedTools", "*"]
 
 
 def _build_claude_argv(
@@ -166,7 +164,7 @@ def _build_codex_argv(
     resume: str | None,
     tools_allowed: bool,
 ) -> list[str]:
-    sandbox = "workspace-write" if tools_allowed else "read-only"
+    sandbox = "read-only"
     if resume:
         argv = [
             "codex",
@@ -328,12 +326,12 @@ def _run_subprocess(
     env: Mapping[str, str],
     slot_uid: int,
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
+    proc = subprocess.Popen(
         argv,
-        input=prompt,
-        capture_output=True,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        timeout=timeout,
         cwd=str(cwd),
         env=dict(env),
         user=slot_uid,
@@ -341,6 +339,26 @@ def _run_subprocess(
         extra_groups=[],
         start_new_session=True,
     )
+    try:
+        stdout, stderr = proc.communicate(input=prompt, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.wait()
+        raise
+    return subprocess.CompletedProcess(argv, proc.returncode, stdout=stdout, stderr=stderr)
+
+
+def _reject_unsupported_tools(claims: Mapping[str, Any]) -> None:
+    if bool(claims["tools_allowed"]):
+        # Owner-private full-tools requires a later filesystem boundary stage
+        # (chroot/mount namespace/Landlock). Stage 1 remains tool-free.
+        raise HTTPException(
+            status_code=403,
+            detail="tools not supported until isolation sandbox lands (later stage)",
+        )
 
 
 def _execute_provider(
@@ -485,6 +503,7 @@ async def run(
         claims = verify_claim(x_wd_claim, CLAIM_SECRET, body=body)
         if claims["mode"] != "A":
             raise WDClaimError("Stage 1 supports mode A only")
+        _reject_unsupported_tools(claims)
         config_dir, ws_cwd = validate_claim_paths(claims)
         slot_uid = get_or_allocate_uid(str(claims["slot_id"]))
         prepare_slot_dirs(str(claims["slot_id"]), config_dir, ws_cwd, slot_uid)
