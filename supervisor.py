@@ -1,13 +1,39 @@
 from __future__ import annotations
 
 import os
+import fcntl
 import signal
 import subprocess
 import sys
 import time
+import uuid
+
+_LOCK_FH = None
+
+
+def _acquire_instance_lock() -> None:
+    global _LOCK_FH
+    lock_path = os.environ.get("WD_INSTANCE_LOCK", "/data/.wd_executor.lock")
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    _LOCK_FH = open(lock_path, "a+", encoding="utf-8")
+    try:
+        fcntl.flock(_LOCK_FH.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        raise RuntimeError("another WD executor instance is already running") from exc
 
 
 def main() -> int:
+    workers = int(os.environ.get("WD_UVICORN_WORKERS", "1"))
+    if workers != 1:
+        print("WD_UVICORN_WORKERS must be 1", file=sys.stderr)
+        return 1
+    try:
+        _acquire_instance_lock()
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    os.environ.setdefault("WD_INSTANCE_ID", str(uuid.uuid4()))
+
     procs: list[subprocess.Popen[bytes]] = []
     wd_host = os.environ.get("WD_EXECUTOR_HOST", os.environ.get("CC_EXECUTOR_HOST", "0.0.0.0"))
     wd_port = os.environ.get("WD_EXECUTOR_PORT", "9101")
@@ -22,6 +48,8 @@ def main() -> int:
                 wd_host,
                 "--port",
                 wd_port,
+                "--workers",
+                "1",
             ],
         ),
     )

@@ -41,6 +41,8 @@ import uuid
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 
+import login_core
+
 HOST = os.environ.get("CC_EXECUTOR_HOST", "0.0.0.0")
 PORT = int(os.environ.get("CC_EXECUTOR_PORT", "9100"))
 API_KEY = os.environ.get("CC_API_KEY", "")
@@ -726,18 +728,11 @@ _ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
 def _strip_ansi(text):
-    return _ANSI_RE.sub("", text or "")
+    return login_core.strip_ansi(text)
 
 
 def _parse_codex_device_login_output(text):
-    # Fixture shape observed from Codex 0.133.0: ANSI text containing
-    # https://auth.openai.com/codex/device and MZHT-0HT0G.
-    clean = _strip_ansi(text)
-    url_match = _CODEX_LOGIN_URL_RE.search(clean)
-    url = url_match.group(0) if url_match else None
-    m = _CODEX_USER_CODE_RE.search(clean)
-    user_code = m.group(0) if m else None
-    return url, user_code
+    return login_core.parse_codex_device_login_output(text)
 
 
 def _terminate_proc(proc, timeout=1):
@@ -837,7 +832,7 @@ atexit.register(_kill_all_codex_login_sessions)
 
 
 def _b64url(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+    return login_core.b64url(data)
 
 
 def _reap_oauth_sessions():
@@ -848,56 +843,11 @@ def _reap_oauth_sessions():
 
 
 def _normalize_code(raw):
-    """Accept bare code, 'code#state', or the full callback URL.
-    Returns (code, state_or_None). Empty code → ('', None)."""
-    raw = (raw or "").strip()
-    if not raw:
-        return "", None
-    if raw.startswith("http://") or raw.startswith("https://"):
-        parsed = urllib.parse.urlparse(raw)
-        qs = urllib.parse.parse_qs(parsed.query)
-        return (qs.get("code") or [""])[0], (qs.get("state") or [None])[0]
-    if "#" in raw:
-        code, _, state = raw.partition("#")
-        return code.strip(), state.strip() or None
-    if "&state=" in raw:
-        code, _, rest = raw.partition("&state=")
-        return code.strip(), rest.strip() or None
-    return raw, None
+    return login_core.normalize_claude_oauth_code(raw)
 
 
 def _exchange_code_for_token(code, code_verifier, state):
-    """POST to Anthropic's token endpoint. Returns (status, body_dict)."""
-    payload = json.dumps({
-        "grant_type": "authorization_code",
-        "client_id": _CLIENT_ID,
-        "code": code,
-        "redirect_uri": _REDIRECT_URI,
-        "code_verifier": code_verifier,
-        "state": state,
-    }).encode("utf-8")
-    req = urllib.request.Request(
-        _TOKEN_URL,
-        data=payload,
-        method="POST",
-        headers={
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "User-Agent": "cc-executor/oauth",
-        },
-    )
-    ctx = ssl.create_default_context()
-    try:
-        with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
-            return resp.status, json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        try:
-            body = json.loads(exc.read().decode("utf-8"))
-        except Exception:
-            body = {"error": {"message": f"HTTP {exc.code}"}}
-        return exc.code, body
-    except (urllib.error.URLError, TimeoutError) as exc:
-        return 0, {"error": {"message": f"network: {exc}"}}
+    return login_core.exchange_code_for_token(code, code_verifier, state)
 
 
 def _write_credentials(creds: dict, claude_config_dir=None) -> tuple[bool, str]:
@@ -906,22 +856,10 @@ def _write_credentials(creds: dict, claude_config_dir=None) -> tuple[bool, str]:
         _, claude_dir = _claude_env(claude_config_dir)
     except ValueError as exc:
         return False, str(exc)
-    target = os.path.join(claude_dir, ".credentials.json")
-    tmp = target + ".tmp"
     try:
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(creds, fh, ensure_ascii=False)
-        try:
-            os.chmod(tmp, 0o600)
-        except Exception:
-            pass
-        os.replace(tmp, target)
+        login_core.atomic_write_json(os.path.join(claude_dir, ".credentials.json"), creds)
         return True, ""
     except Exception as exc:
-        try:
-            os.unlink(tmp)
-        except Exception:
-            pass
         return False, str(exc)
 
 
@@ -968,20 +906,7 @@ def _decode_jwt_payload(token):
 
 
 def _codex_auth_expiry(config_dir):
-    try:
-        with open(os.path.join(config_dir, "auth.json"), "r", encoding="utf-8") as fh:
-            auth = json.load(fh)
-        tokens = auth.get("tokens") if isinstance(auth, dict) else None
-        if not isinstance(tokens, dict):
-            return None, None
-        payload = _decode_jwt_payload(tokens.get("access_token") or tokens.get("id_token"))
-        exp = payload.get("exp") if isinstance(payload, dict) else None
-        if exp is None:
-            return None, None
-        expires_at = int(exp) * 1000
-        return expires_at, int(time.time() * 1000) > expires_at
-    except Exception:
-        return None, None
+    return login_core.codex_auth_expiry(os.path.join(config_dir, "auth.json"))
 
 
 def _codex_cli_available():
@@ -1475,29 +1400,16 @@ class Handler(BaseHTTPRequestHandler):
             return
         _reap_oauth_sessions()
 
-        state = secrets.token_hex(32)
-        code_verifier = _b64url(secrets.token_bytes(32))
-        code_challenge = _b64url(hashlib.sha256(code_verifier.encode("ascii")).digest())
-
+        state, code_verifier, auth_url = login_core.new_pkce()
         session_id = str(uuid.uuid4())
         _OAUTH_SESSIONS[session_id] = {
             "state": state,
             "code_verifier": code_verifier,
             "created_at": time.time(),
         }
-        qs = urllib.parse.urlencode({
-            "code": "true",
-            "client_id": _CLIENT_ID,
-            "response_type": "code",
-            "redirect_uri": _REDIRECT_URI,
-            "scope": _SCOPE,
-            "code_challenge": code_challenge,
-            "code_challenge_method": "S256",
-            "state": state,
-        })
         self._json_response(200, {
             "session_id": session_id,
-            "url": f"{_AUTH_URL}?{qs}",
+            "url": auth_url,
         })
 
     # ── /admin/oauth/complete ──

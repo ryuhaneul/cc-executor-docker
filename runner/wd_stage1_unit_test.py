@@ -1,13 +1,21 @@
 from __future__ import annotations
 
 import json
+import base64
+import hashlib
+import hmac
+import os
 import subprocess
 import sys
 import tempfile
+import time
+import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import login_core
+import wd_security
 import wd_server
 
 
@@ -267,6 +275,132 @@ def test_codex_argv_env_and_last_message_file() -> None:
     assert call["group"] == 23457
 
 
+def _b64url(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def _login_claim(secret: str, body: dict[str, object], **overrides: object) -> str:
+    slot_id = str(overrides.pop("slot_id", uuid.uuid4()))
+    tenant_id = str(overrides.pop("tenant_id", uuid.uuid4()))
+    provider = str(overrides.pop("provider", "claude"))
+    payload = {
+        "slot_id": slot_id,
+        "slot_tenant_id": str(overrides.pop("slot_tenant_id", tenant_id)),
+        "tenant_id": tenant_id,
+        "requester_id": str(overrides.pop("requester_id", uuid.uuid4())),
+        "provider": provider,
+        "config_dir": str(overrides.pop("config_dir", f"/data/auth/{provider}/users/{slot_id}")),
+        "exp": int(time.time()) + 600,
+        "jti": str(uuid.uuid4()),
+        "kid": "stage2-test",
+        "op": str(overrides.pop("op", "wd.login")),
+    }
+    payload.update(overrides)
+    payload["body_hash"] = wd_security.compute_body_hash(body)
+    segment = _b64url(wd_security.canonical_json_bytes(payload))
+    sig = hmac.new(secret.encode("utf-8"), segment.encode("ascii"), hashlib.sha256).digest()
+    return f"{segment}.{_b64url(sig)}"
+
+
+def test_login_claim_contract_and_bad_op_rejected() -> None:
+    body = {"login_id": str(uuid.uuid4())}
+    token = _login_claim("secret", body)
+    claims = wd_security.verify_claim(token, "secret", body=body, expected_op="wd.login")
+    assert claims["op"] == "wd.login"
+    assert "ws_cwd" not in claims
+
+    bad = _login_claim("secret", body, op="wd.run")
+    try:
+        wd_security.verify_claim(bad, "secret", body=body, expected_op="wd.login")
+    except wd_security.WDClaimError as exc:
+        assert "missing claim fields" in str(exc) or "op mismatch" in str(exc)
+    else:
+        raise AssertionError("bad op must be rejected")
+
+
+def test_login_complete_binding_mismatch_rejected() -> None:
+    claims = {
+        "slot_id": str(uuid.uuid4()),
+        "slot_tenant_id": str(uuid.uuid4()),
+        "tenant_id": str(uuid.uuid4()),
+        "requester_id": str(uuid.uuid4()),
+        "provider": "claude",
+    }
+    session = {**claims, "config_dir": "/data/auth/claude/users/x", "slot_uid": 20000}
+    changed = dict(claims)
+    changed["tenant_id"] = str(uuid.uuid4())
+    login_id = str(uuid.uuid4())
+    with wd_server._LOGIN_LOCK:
+        wd_server._LOGIN_SESSIONS[login_id] = session
+    try:
+        try:
+            wd_server._get_bound_session(login_id, changed)
+        except wd_server.HTTPException as exc:
+            assert exc.status_code == 403
+        else:
+            raise AssertionError("cross-tenant complete must be rejected")
+    finally:
+        with wd_server._LOGIN_LOCK:
+            wd_server._LOGIN_SESSIONS.pop(login_id, None)
+
+
+def test_normalize_claude_oauth_code_and_state_required() -> None:
+    code, state = login_core.normalize_claude_oauth_code("https://console.anthropic.com/oauth/code/callback?code=abc&state=st")
+    assert (code, state) == ("abc", "st")
+    assert login_core.normalize_claude_oauth_code("abc#st") == ("abc", "st")
+
+
+def test_login_status_uses_slot_credentials_only() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        config_dir = Path(tmp)
+        creds = {
+            "claudeAiOauth": {
+                "accessToken": "x",
+                "refreshToken": "y",
+                "expiresAt": int(time.time() * 1000) + 60000,
+            }
+        }
+        (config_dir / ".credentials.json").write_text(json.dumps(creds), encoding="utf-8")
+        status = wd_server._slot_status("claude", str(uuid.uuid4()), config_dir)
+        assert status["loggedIn"] is True
+        assert status["expiresAt"] == creds["claudeAiOauth"]["expiresAt"]
+
+
+def test_codex_login_spawn_uses_slot_uid_and_session() -> None:
+    original = wd_server.subprocess.Popen
+    calls: list[dict[str, object]] = []
+
+    def fake_popen(argv: list[str], **kwargs: object) -> FakeProc:
+        calls.append({"argv": argv, **kwargs})
+        return FakeProc(stdout="")
+
+    try:
+        wd_server.subprocess.Popen = fake_popen  # type: ignore[assignment]
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = wd_server._spawn_codex_login(Path(tmp), 23458)
+    finally:
+        wd_server.subprocess.Popen = original  # type: ignore[assignment]
+
+    assert proc.returncode == 0
+    call = calls[-1]
+    assert call["argv"] == ["codex", "login", "--device-auth"]
+    assert call["user"] == 23458
+    assert call["group"] == 23458
+    assert call["extra_groups"] == []
+    assert call["start_new_session"] is True
+
+
+def test_codex_auth_json_owner_mode_failure() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "auth.json"
+        path.write_text("{}", encoding="utf-8")
+        os.chmod(path, 0o644)
+        assert wd_server._codex_auth_valid(path, os.getuid()) is False
+        os.chmod(path, 0o600)
+        assert wd_server._codex_auth_valid(path, os.getuid()) is True
+        assert wd_server._codex_auth_valid(path, os.getuid() + 10000) is False
+
+
 if __name__ == "__main__":
     test_claude_parser()
     test_codex_parser()
@@ -275,4 +409,10 @@ if __name__ == "__main__":
     test_run_subprocess_timeout_kills_process_group()
     test_codex_non_resume_argv_has_no_literal_stdin_prompt()
     test_codex_argv_env_and_last_message_file()
+    test_login_claim_contract_and_bad_op_rejected()
+    test_login_complete_binding_mismatch_rejected()
+    test_normalize_claude_oauth_code_and_state_required()
+    test_login_status_uses_slot_credentials_only()
+    test_codex_login_spawn_uses_slot_uid_and_session()
+    test_codex_auth_json_owner_mode_failure()
     print("PASS wd_stage1_unit_test")

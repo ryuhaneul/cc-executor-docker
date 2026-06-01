@@ -16,7 +16,7 @@ RUN mkdir -p /root/.claude/users /root/.codex/users && \
     ln -sf /root/.claude/.claude.json /root/.claude.json
 
 WORKDIR /app
-COPY server.py wd_security.py wd_server.py supervisor.py ./
+COPY server.py login_core.py wd_security.py wd_server.py supervisor.py ./
 RUN mkdir -p /app/workdir /data/auth/claude/users /data/auth/codex/users /data/ws /data/tmp
 
 EXPOSE 9100 9101

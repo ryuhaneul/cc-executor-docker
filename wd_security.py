@@ -43,6 +43,20 @@ REQUIRED_CLAIMS = (
     "op",
 )
 
+LOGIN_REQUIRED_CLAIMS = (
+    "slot_id",
+    "slot_tenant_id",
+    "tenant_id",
+    "requester_id",
+    "provider",
+    "config_dir",
+    "exp",
+    "jti",
+    "kid",
+    "body_hash",
+    "op",
+)
+
 
 class WDClaimError(ValueError):
     pass
@@ -168,7 +182,7 @@ def verify_claim(
         raise WDClaimError("bad claim payload") from exc
     if not isinstance(claims, dict):
         raise WDClaimError("bad claim payload")
-    _validate_claim_shape(claims)
+    _validate_claim_shape(claims, expected_op=expected_op)
 
     current_time = int(time.time()) if now is None else now
     if int(claims["exp"]) <= current_time:
@@ -186,40 +200,56 @@ def verify_claim(
     return claims
 
 
-def _validate_claim_shape(claims: Mapping[str, Any]) -> None:
-    missing = [name for name in REQUIRED_CLAIMS if name not in claims]
+def _validate_claim_shape(claims: Mapping[str, Any], expected_op: str = "wd.run") -> None:
+    required = LOGIN_REQUIRED_CLAIMS if expected_op == "wd.login" else REQUIRED_CLAIMS
+    missing = [name for name in required if name not in claims]
     if missing:
         raise WDClaimError(f"missing claim fields: {', '.join(missing)}")
+    if expected_op == "wd.login":
+        run_only = {
+            "chatroom_id",
+            "ws_cwd",
+            "mode",
+            "tools_allowed",
+            "owner_private",
+            "lease_epoch",
+            "fence",
+        }
+        present = sorted(name for name in run_only if name in claims)
+        if present:
+            raise WDClaimError(f"unexpected login claim fields: {', '.join(present)}")
 
-    for name in (
+    common_string_fields = (
         "slot_id",
         "slot_tenant_id",
         "tenant_id",
-        "chatroom_id",
         "requester_id",
         "provider",
         "config_dir",
-        "ws_cwd",
-        "mode",
-        "fence",
         "jti",
         "kid",
         "body_hash",
         "op",
-    ):
+    )
+    run_string_fields = ("chatroom_id", "ws_cwd", "mode", "fence")
+    for name in common_string_fields + (() if expected_op == "wd.login" else run_string_fields):
         if not isinstance(claims[name], str) or not claims[name]:
             raise WDClaimError(f"bad claim field: {name}")
     if claims["provider"] not in {"claude", "codex"}:
         raise WDClaimError("bad claim field: provider")
-    if claims["mode"] not in {"A", "B"}:
+    if expected_op != "wd.login" and claims["mode"] not in {"A", "B"}:
         raise WDClaimError("bad claim field: mode")
-    for name in ("tools_allowed", "owner_private"):
-        if not isinstance(claims[name], bool):
-            raise WDClaimError(f"bad claim field: {name}")
-    for name in ("lease_epoch", "exp"):
+    if expected_op != "wd.login":
+        for name in ("tools_allowed", "owner_private"):
+            if not isinstance(claims[name], bool):
+                raise WDClaimError(f"bad claim field: {name}")
+    for name in (("exp",) if expected_op == "wd.login" else ("lease_epoch", "exp")):
         if not isinstance(claims[name], int):
             raise WDClaimError(f"bad claim field: {name}")
-    for name in ("slot_id", "slot_tenant_id", "tenant_id", "chatroom_id", "requester_id"):
+    uuid_fields = ("slot_id", "slot_tenant_id", "tenant_id", "requester_id")
+    if expected_op != "wd.login":
+        uuid_fields += ("chatroom_id",)
+    for name in uuid_fields:
         try:
             uuid.UUID(str(claims[name]))
         except ValueError as exc:
@@ -263,6 +293,13 @@ def validate_claim_paths(claims: Mapping[str, Any]) -> tuple[Path, Path]:
     config_dir = _validate_direct_child(str(claims["config_dir"]), config_root, slot_id, "config_dir")
     ws_cwd = _validate_direct_child(str(claims["ws_cwd"]), ws_owner_root, chatroom_id, "ws_cwd")
     return config_dir, ws_cwd
+
+
+def validate_login_claim_path(claims: Mapping[str, Any]) -> Path:
+    provider = str(claims["provider"])
+    slot_id = str(claims["slot_id"])
+    config_root = AUTH_ROOT / provider / "users"
+    return _validate_direct_child(str(claims["config_dir"]), config_root, slot_id, "config_dir")
 
 
 def _fsync_dir(path: Path) -> None:
@@ -326,3 +363,10 @@ def prepare_slot_dirs(slot_id: str, config_dir: Path, ws_cwd: Path, uid: int) ->
         # CAP_FOWNER 없이 chmod 불가(EPERM). root 소유일 때 chmod 후 chown.
         os.chmod(path, 0o700)
         os.chown(path, uid, uid)
+
+
+def prepare_config_dir(slot_id: str, config_dir: Path, uid: int) -> None:
+    config_dir.mkdir(parents=True, exist_ok=True)
+    _reject_symlink_components(config_dir)
+    os.chmod(config_dir, 0o700)
+    os.chown(config_dir, uid, uid)

@@ -5,8 +5,11 @@ import os
 import re
 import signal
 import subprocess
+import tempfile
+import threading
 import time
 import uuid
+import atexit
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -14,11 +17,14 @@ from typing import Any
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 
+import login_core
 from wd_security import (
     WDClaimError,
     get_or_allocate_uid,
+    prepare_config_dir,
     prepare_slot_dirs,
     validate_claim_paths,
+    validate_login_claim_path,
     verify_claim,
 )
 
@@ -55,6 +61,12 @@ _SENSITIVE_PATTERNS = (
 )
 
 app = FastAPI(title="cc-executor webductor mode")
+INSTANCE_ID = os.environ.get("WD_INSTANCE_ID", str(uuid.uuid4()))
+LOGIN_TTL_SECONDS = min(int(os.environ.get("WD_LOGIN_TTL_SECONDS", "600")), 600)
+CODEX_LOGIN_PARSE_TIMEOUT = float(os.environ.get("WD_CODEX_LOGIN_PARSE_TIMEOUT", "15"))
+_LOGIN_SESSIONS: dict[str, dict[str, Any]] = {}
+_LOGIN_LOCK = threading.Lock()
+_REAPER_STARTED = False
 
 
 def _auth_ok(authorization: str | None) -> bool:
@@ -472,13 +484,436 @@ def _run_response(
     }
 
 
+def _kill_process_group(proc: subprocess.Popen[Any]) -> None:
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+
+def _cleanup_login_session(login_id: str, session: Mapping[str, Any] | None = None) -> None:
+    data = dict(session or {})
+    proc = data.get("proc")
+    if isinstance(proc, subprocess.Popen):
+        _kill_process_group(proc)
+    with _LOGIN_LOCK:
+        if login_id in _LOGIN_SESSIONS and (not session or _LOGIN_SESSIONS[login_id] is session):
+            _LOGIN_SESSIONS.pop(login_id, None)
+
+
+def _reap_login_sessions_once() -> None:
+    now = time.time()
+    expired: list[tuple[str, dict[str, Any]]] = []
+    with _LOGIN_LOCK:
+        for login_id, session in list(_LOGIN_SESSIONS.items()):
+            if float(session.get("expires_at", 0)) <= now:
+                expired.append((login_id, session))
+                _LOGIN_SESSIONS.pop(login_id, None)
+    for _login_id, session in expired:
+        proc = session.get("proc")
+        if isinstance(proc, subprocess.Popen):
+            _kill_process_group(proc)
+
+
+def _reaper_loop() -> None:
+    while True:
+        _reap_login_sessions_once()
+        time.sleep(30)
+
+
+def _start_reaper() -> None:
+    global _REAPER_STARTED
+    if _REAPER_STARTED:
+        return
+    _REAPER_STARTED = True
+    thread = threading.Thread(target=_reaper_loop, name="wd-login-reaper", daemon=True)
+    thread.start()
+
+
+def _kill_all_login_sessions() -> None:
+    with _LOGIN_LOCK:
+        sessions = list(_LOGIN_SESSIONS.items())
+        _LOGIN_SESSIONS.clear()
+    for _login_id, session in sessions:
+        proc = session.get("proc")
+        if isinstance(proc, subprocess.Popen):
+            _kill_process_group(proc)
+
+
+atexit.register(_kill_all_login_sessions)
+
+
+@app.on_event("startup")
+async def _startup() -> None:
+    _start_reaper()
+
+
+async def _json_body(request: Request) -> dict[str, Any]:
+    raw = await request.body()
+    if not raw:
+        return {}
+    try:
+        body = json.loads(raw)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="invalid JSON") from exc
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="body must be an object")
+    return body
+
+
+def _verify_login_claim(
+    *,
+    body: Mapping[str, Any],
+    authorization: str | None,
+    x_wd_claim: str | None,
+) -> tuple[dict[str, Any], Path, int]:
+    if not _auth_ok(authorization):
+        raise HTTPException(status_code=403, detail="invalid API key")
+    if not x_wd_claim:
+        raise HTTPException(status_code=403, detail="missing WD claim")
+    try:
+        claims = verify_claim(x_wd_claim, CLAIM_SECRET, body=body, expected_op="wd.login")
+        config_dir = validate_login_claim_path(claims)
+        slot_uid = get_or_allocate_uid(str(claims["slot_id"]))
+        prepare_config_dir(str(claims["slot_id"]), config_dir, slot_uid)
+    except WDClaimError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"slot dir preparation failed: {exc}") from exc
+    return claims, config_dir, slot_uid
+
+
+def _login_id_from(body: Mapping[str, Any]) -> str:
+    login_id = body.get("login_id")
+    if not isinstance(login_id, str) or not login_id:
+        raise HTTPException(status_code=422, detail="login_id is required")
+    try:
+        uuid.UUID(login_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="login_id must be a UUID") from exc
+    return login_id
+
+
+def _session_binding(claims: Mapping[str, Any]) -> dict[str, str]:
+    return {
+        "slot_id": str(claims["slot_id"]),
+        "slot_tenant_id": str(claims["slot_tenant_id"]),
+        "tenant_id": str(claims["tenant_id"]),
+        "requester_id": str(claims["requester_id"]),
+        "provider": str(claims["provider"]),
+    }
+
+
+def _get_bound_session(login_id: str, claims: Mapping[str, Any]) -> dict[str, Any]:
+    with _LOGIN_LOCK:
+        session = _LOGIN_SESSIONS.get(login_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="login session expired or unknown")
+    if float(session.get("expires_at", 0)) <= time.time():
+        _cleanup_login_session(login_id, session)
+        raise HTTPException(status_code=404, detail="login session expired or unknown")
+    for key, value in _session_binding(claims).items():
+        if session.get(key) != value:
+            raise HTTPException(status_code=403, detail="login session binding mismatch")
+    return session
+
+
+def _write_slot_json(path: Path, data: dict[str, Any], uid: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp_name, 0o600)
+        os.chown(tmp_name, uid, uid)
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def _claude_credentials_from_token(token: Mapping[str, Any]) -> dict[str, Any]:
+    expires_at_ms = (int(time.time()) + int(token.get("expires_in") or 0)) * 1000
+    scopes = [item for item in str(token.get("scope") or login_core.SCOPE).split() if item]
+    return {
+        "claudeAiOauth": {
+            "accessToken": token["access_token"],
+            "refreshToken": token.get("refresh_token"),
+            "expiresAt": expires_at_ms,
+            "scopes": scopes or login_core.SCOPE.split(),
+            "isMax": True,
+        }
+    }
+
+
+def _slot_status(provider: str, slot_id: str, config_dir: Path) -> dict[str, Any]:
+    if provider == "claude":
+        expires_at, expired = login_core.claude_creds_expiry(config_dir / ".credentials.json")
+    else:
+        expires_at, expired = login_core.codex_auth_expiry(config_dir / "auth.json")
+    pending = False
+    login_expires_at: int | None = None
+    now = time.time()
+    with _LOGIN_LOCK:
+        for session in _LOGIN_SESSIONS.values():
+            if (
+                session.get("provider") == provider
+                and session.get("slot_id") == slot_id
+                and float(session.get("expires_at", 0)) > now
+            ):
+                pending = True
+                login_expires_at = int(float(session["expires_at"]) * 1000)
+                break
+    return {
+        "provider": provider,
+        "slot_id": slot_id,
+        "loggedIn": expires_at is not None and expired is False,
+        "expiresAt": expires_at,
+        "expired": expired,
+        "pending": pending,
+        "loginExpiresAt": login_expires_at,
+    }
+
+
+def _read_codex_login_output(login_id: str, proc: subprocess.Popen[str]) -> None:
+    if proc.stdout is None:
+        return
+    for line in proc.stdout:
+        with _LOGIN_LOCK:
+            session = _LOGIN_SESSIONS.get(login_id)
+            if not session:
+                return
+            session["output"] = str(session.get("output", "")) + line
+            url, user_code = login_core.parse_codex_device_login_output(str(session["output"]))
+            if url:
+                session["verification_url"] = url
+            if user_code:
+                session["user_code"] = user_code
+
+
+def _spawn_codex_login(config_dir: Path, slot_uid: int) -> subprocess.Popen[str]:
+    return subprocess.Popen(
+        ["codex", "login", "--device-auth"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        cwd=str(config_dir),
+        env=_provider_env("codex", config_dir, config_dir),
+        user=slot_uid,
+        group=slot_uid,
+        extra_groups=[],
+        start_new_session=True,
+    )
+
+
+def _codex_auth_valid(path: Path, uid: int) -> bool:
+    try:
+        stat = path.stat()
+    except OSError:
+        return False
+    if stat.st_uid != uid or stat.st_gid != uid:
+        return False
+    return stat.st_mode & 0o777 == 0o600
+
+
 @app.get("/wd/health")
 async def health() -> dict[str, object]:
     return {
         "status": "ok",
+        "instance_id": INSTANCE_ID,
         "legacy_disabled": os.environ.get("CC_DISABLE_LEGACY", "false").lower()
         in {"1", "true", "yes", "on"},
     }
+
+
+@app.post("/wd/v1/login/start")
+async def login_start(
+    request: Request,
+    authorization: str | None = Header(default=None),
+    x_wd_claim: str | None = Header(default=None, alias="X-WD-Claim"),
+) -> dict[str, object]:
+    body = await _json_body(request)
+    login_id = _login_id_from(body)
+    claims, config_dir, slot_uid = _verify_login_claim(
+        body=body,
+        authorization=authorization,
+        x_wd_claim=x_wd_claim,
+    )
+    provider = str(claims["provider"])
+    expires_at = time.time() + LOGIN_TTL_SECONDS
+    session: dict[str, Any] = {
+        **_session_binding(claims),
+        "config_dir": str(config_dir),
+        "slot_uid": slot_uid,
+        "status": "pending",
+        "created_at": time.time(),
+        "expires_at": expires_at,
+    }
+    with _LOGIN_LOCK:
+        if login_id in _LOGIN_SESSIONS:
+            raise HTTPException(status_code=409, detail="login_id already exists")
+    if provider == "claude":
+        state, code_verifier, auth_url = login_core.new_pkce()
+        session["state"] = state
+        session["code_verifier"] = code_verifier
+        with _LOGIN_LOCK:
+            _LOGIN_SESSIONS[login_id] = session
+        return {"ok": True, "provider": provider, "login_id": login_id, "auth_url": auth_url}
+
+    proc = _spawn_codex_login(config_dir, slot_uid)
+    session["proc"] = proc
+    session["output"] = ""
+    with _LOGIN_LOCK:
+        _LOGIN_SESSIONS[login_id] = session
+    threading.Thread(
+        target=_read_codex_login_output,
+        args=(login_id, proc),
+        name=f"wd-codex-login-{login_id}",
+        daemon=True,
+    ).start()
+    deadline = time.time() + CODEX_LOGIN_PARSE_TIMEOUT
+    while time.time() < deadline:
+        with _LOGIN_LOCK:
+            current = _LOGIN_SESSIONS.get(login_id, {})
+            url = current.get("verification_url")
+            user_code = current.get("user_code")
+        if isinstance(url, str) and isinstance(user_code, str):
+            return {
+                "ok": True,
+                "provider": provider,
+                "login_id": login_id,
+                "verification_url": url,
+                "user_code": user_code,
+            }
+        if proc.poll() is not None:
+            _cleanup_login_session(login_id, session)
+            raise HTTPException(status_code=502, detail="codex login exited before device code")
+        time.sleep(0.1)
+    return {
+        "ok": False,
+        "provider": provider,
+        "login_id": login_id,
+        "error": "codex login did not emit device code",
+    }
+
+
+@app.post("/wd/v1/login/complete")
+async def login_complete(
+    request: Request,
+    authorization: str | None = Header(default=None),
+    x_wd_claim: str | None = Header(default=None, alias="X-WD-Claim"),
+) -> dict[str, object]:
+    body = await _json_body(request)
+    login_id = _login_id_from(body)
+    claims, _request_config_dir, _slot_uid = _verify_login_claim(
+        body=body,
+        authorization=authorization,
+        x_wd_claim=x_wd_claim,
+    )
+    session = _get_bound_session(login_id, claims)
+    provider = str(session["provider"])
+    config_dir = Path(str(session["config_dir"]))
+    slot_uid = int(session["slot_uid"])
+    if provider == "claude":
+        raw_code = body.get("code")
+        if not isinstance(raw_code, str) or not raw_code:
+            raise HTTPException(status_code=422, detail="code is required")
+        code, state = login_core.normalize_claude_oauth_code(raw_code)
+        if not code:
+            raise HTTPException(status_code=422, detail="code is required")
+        if state != session["state"]:
+            raise HTTPException(status_code=403, detail="state mismatch")
+        status, token = login_core.exchange_code_for_token(
+            code,
+            str(session["code_verifier"]),
+            str(session["state"]),
+        )
+        if status != 200 or not isinstance(token, dict) or not token.get("access_token"):
+            message = "token exchange failed"
+            err = token.get("error") if isinstance(token, dict) else None
+            if isinstance(err, dict) and isinstance(err.get("message"), str):
+                message = err["message"]
+            return {"ok": False, "provider": provider, "login_id": login_id, "status": "failed", "error": _mask_secrets(message)}
+        _write_slot_json(config_dir / ".credentials.json", _claude_credentials_from_token(token), slot_uid)
+        _cleanup_login_session(login_id, session)
+        return {"ok": True, "provider": provider, "login_id": login_id, "status": "ok"}
+
+    proc = session.get("proc")
+    if isinstance(proc, subprocess.Popen) and proc.poll() is None:
+        return {"ok": False, "provider": provider, "login_id": login_id, "status": "pending"}
+    auth_path = config_dir / "auth.json"
+    if _codex_auth_valid(auth_path, slot_uid):
+        _cleanup_login_session(login_id, session)
+        return {"ok": True, "provider": provider, "login_id": login_id, "status": "ok"}
+    try:
+        auth_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+    _cleanup_login_session(login_id, session)
+    return {
+        "ok": False,
+        "provider": provider,
+        "login_id": login_id,
+        "status": "failed",
+        "error": "codex auth.json missing or invalid owner/mode",
+    }
+
+
+@app.get("/wd/v1/login/status")
+@app.post("/wd/v1/login/status")
+async def login_status(
+    request: Request,
+    authorization: str | None = Header(default=None),
+    x_wd_claim: str | None = Header(default=None, alias="X-WD-Claim"),
+) -> dict[str, object]:
+    body = await _json_body(request)
+    claims, config_dir, _slot_uid = _verify_login_claim(
+        body=body,
+        authorization=authorization,
+        x_wd_claim=x_wd_claim,
+    )
+    return _slot_status(str(claims["provider"]), str(claims["slot_id"]), config_dir)
+
+
+@app.delete("/wd/v1/login")
+async def login_logout(
+    request: Request,
+    authorization: str | None = Header(default=None),
+    x_wd_claim: str | None = Header(default=None, alias="X-WD-Claim"),
+) -> dict[str, object]:
+    body = await _json_body(request)
+    claims, config_dir, _slot_uid = _verify_login_claim(
+        body=body,
+        authorization=authorization,
+        x_wd_claim=x_wd_claim,
+    )
+    provider = str(claims["provider"])
+    for name in ((".credentials.json",) if provider == "claude" else ("auth.json",)):
+        try:
+            (config_dir / name).unlink(missing_ok=True)
+        except OSError:
+            pass
+    with _LOGIN_LOCK:
+        matching = [
+            (login_id, session)
+            for login_id, session in _LOGIN_SESSIONS.items()
+            if session.get("slot_id") == claims["slot_id"] and session.get("provider") == provider
+        ]
+    for login_id, session in matching:
+        _cleanup_login_session(login_id, session)
+    return {"ok": True, "provider": provider, "slot_id": claims["slot_id"]}
 
 
 @app.post("/wd/v1/run")
