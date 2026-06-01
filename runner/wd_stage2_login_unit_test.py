@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import asyncio
 import hmac
 import hashlib
 import json
@@ -11,8 +12,6 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any
-
-from fastapi.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -63,6 +62,37 @@ def _headers(body: dict[str, Any], *, provider: str = "claude", op: str = "wd.lo
         "Authorization": f"Bearer {API_KEY}",
         "X-WD-Claim": _claim(body, provider=provider, op=op),
     }
+
+
+class FakeRequest:
+    def __init__(self, body: dict[str, Any], method: str = "POST") -> None:
+        self._body = json.dumps(body).encode("utf-8")
+        self.method = method
+
+    async def body(self) -> bytes:
+        return self._body
+
+
+def _call_login_complete(body: dict[str, Any], *, provider: str = "claude") -> dict[str, Any]:
+    headers = _headers(body, provider=provider)
+    return asyncio.run(
+        wd_server.login_complete(
+            FakeRequest(body),  # type: ignore[arg-type]
+            authorization=headers["Authorization"],
+            x_wd_claim=headers["X-WD-Claim"],
+        )
+    )
+
+
+def _call_login_status(body: dict[str, Any], *, provider: str = "claude") -> dict[str, Any]:
+    headers = _headers(body, provider=provider)
+    return asyncio.run(
+        wd_server.login_status(
+            FakeRequest(body),  # type: ignore[arg-type]
+            authorization=headers["Authorization"],
+            x_wd_claim=headers["X-WD-Claim"],
+        )
+    )
 
 
 def _binding(provider: str = "claude") -> dict[str, str]:
@@ -152,7 +182,6 @@ def test_claude_complete_binding_state_and_session_config_dir() -> None:
                 200,
                 {"access_token": "access-token", "refresh_token": "refresh-token", "expires_in": 60},
             )
-            client = TestClient(wd_server.app)
             login_id = str(uuid.uuid4())
             wd_server._LOGIN_SESSIONS[login_id] = {
                 **_binding("claude"),
@@ -163,9 +192,8 @@ def test_claude_complete_binding_state_and_session_config_dir() -> None:
                 "expires_at": time.time() + 60,
             }
             body = {"login_id": login_id, "code": "code-a#state-a", "config_dir": str(attacker_config)}
-            response = client.post("/wd/v1/login/complete", json=body, headers=_headers(body))
-            assert response.status_code == 200, response.text
-            assert response.json()["status"] == "ok"
+            data = _call_login_complete(body)
+            assert data["status"] == "ok"
             assert (session_config / ".credentials.json").exists()
             assert not (attacker_config / ".credentials.json").exists()
 
@@ -178,8 +206,12 @@ def test_claude_complete_binding_state_and_session_config_dir() -> None:
                 "expires_at": time.time() + 60,
             }
             bad_state = {"login_id": login_id, "code": "code-a#wrong"}
-            response = client.post("/wd/v1/login/complete", json=bad_state, headers=_headers(bad_state))
-            assert response.status_code == 403
+            try:
+                _call_login_complete(bad_state)
+            except wd_server.HTTPException as exc:
+                assert exc.status_code == 403
+            else:
+                raise AssertionError("state mismatch must be rejected")
 
             wd_server._LOGIN_SESSIONS[login_id] = {
                 **(_binding("claude") | {"tenant_id": "99999999-9999-4999-8999-999999999999"}),
@@ -189,8 +221,12 @@ def test_claude_complete_binding_state_and_session_config_dir() -> None:
                 "code_verifier": "verifier-a",
                 "expires_at": time.time() + 60,
             }
-            response = client.post("/wd/v1/login/complete", json=bad_state, headers=_headers(bad_state))
-            assert response.status_code == 403
+            try:
+                _call_login_complete(bad_state)
+            except wd_server.HTTPException as exc:
+                assert exc.status_code == 403
+            else:
+                raise AssertionError("binding mismatch must be rejected")
         finally:
             login_core.exchange_code_for_token = old_exchange  # type: ignore[assignment]
             wd_server._LOGIN_SESSIONS.clear()
@@ -214,11 +250,8 @@ def test_status_reads_slot_creds_only() -> None:
         )
         saved = _patch_executor_auth(config_dir, uid)
         try:
-            client = TestClient(wd_server.app)
             body = {"config_dir": str(other_dir)}
-            response = client.post("/wd/v1/login/status", json=body, headers=_headers(body))
-            assert response.status_code == 200
-            data = response.json()
+            data = _call_login_status(body)
             assert data["loggedIn"] is True
             assert data["expired"] is False
         finally:
@@ -266,7 +299,6 @@ def test_codex_spawn_slot_uid_start_new_session_and_auth_validation_failure() ->
         os.chmod(config_dir / "auth.json", 0o644)
         saved = _patch_executor_auth(config_dir, uid)
         try:
-            client = TestClient(wd_server.app)
             login_id = str(uuid.uuid4())
             wd_server._LOGIN_SESSIONS[login_id] = {
                 **_binding("codex"),
@@ -276,13 +308,8 @@ def test_codex_spawn_slot_uid_start_new_session_and_auth_validation_failure() ->
                 "expires_at": time.time() + 60,
             }
             body = {"login_id": login_id}
-            response = client.post(
-                "/wd/v1/login/complete",
-                json=body,
-                headers=_headers(body, provider="codex"),
-            )
-            assert response.status_code == 200
-            assert response.json()["status"] == "failed"
+            data = _call_login_complete(body, provider="codex")
+            assert data["status"] == "failed"
             assert not (config_dir / "auth.json").exists()
         finally:
             wd_server._LOGIN_SESSIONS.clear()
