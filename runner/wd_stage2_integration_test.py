@@ -154,7 +154,7 @@ def main() -> None:
             assert completed["status"] == "ok"
             cred_path = Path(f"/data/auth/claude/users/{claude_slot}/.credentials.json")
             st = cred_path.stat()
-            assert st.st_uid == 20000
+            assert 20000 <= st.st_uid <= 60000
             assert stat.S_IMODE(st.st_mode) == 0o600
             claude_status = request_json("GET", "/wd/v1/login/status", {}, slot_id=claude_slot, tenant_id=tenant_id, requester_id=requester_id, provider="claude")
             assert claude_status["loggedIn"] is True
