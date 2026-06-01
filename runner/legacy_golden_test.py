@@ -4,79 +4,67 @@ import json
 import os
 import re
 import shutil
-import subprocess
 import sys
 import tempfile
 import threading
 import time
-import urllib.request
 import urllib.error
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import urllib.request
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 
+ROOT_CANDIDATE = Path(__file__).resolve().parents[1]
+ROOT = ROOT_CANDIDATE if (ROOT_CANDIDATE / "server.py").exists() else Path("/app")
+sys.path.insert(0, str(ROOT))
 
-_ROOT_CANDIDATE = Path(__file__).resolve().parents[1]
-ROOT = _ROOT_CANDIDATE if (_ROOT_CANDIDATE / "server.py").exists() else Path("/app")
+import server  # noqa: E402
+
+
 API_KEY = "legacy-golden-api-key"
 
 
-class TokenHandler(BaseHTTPRequestHandler):
-    def do_POST(self) -> None:
-        _ = self.rfile.read(int(self.headers.get("Content-Length", "0")))
-        body = {
-            "access_token": "legacy-access-token",
-            "refresh_token": "legacy-refresh-token",
-            "expires_in": 60,
-            "scope": "org:create_api_key user:profile user:inference",
-        }
-        raw = json.dumps(body).encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(raw)))
-        self.end_headers()
-        self.wfile.write(raw)
-
-    def log_message(self, _fmt: str, *_args: object) -> None:
-        return
-
-
-def request_json(method: str, url: str, body: dict[str, object] | None = None) -> tuple[int, dict[str, object]]:
+def request_json(
+    method: str,
+    url: str,
+    body: dict[str, object] | None = None,
+    headers: dict[str, str] | None = None,
+) -> tuple[int, dict[str, object]]:
     data = json.dumps(body or {}).encode("utf-8") if body is not None else None
-    req = urllib.request.Request(
-        url,
-        data=data,
-        method=method,
-        headers={
-            "Authorization": f"Bearer {API_KEY}",
-            "Content-Type": "application/json",
-        },
-    )
+    request_headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
+    request_headers.update(headers or {})
+    req = urllib.request.Request(url, data=data, method=method, headers=request_headers)
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             return resp.status, json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         raw = exc.read().decode("utf-8", errors="replace")
         try:
-            body = json.loads(raw)
+            return exc.code, json.loads(raw)
         except json.JSONDecodeError:
-            body = {"error": raw}
-        return exc.code, body
+            return exc.code, {"error": raw}
 
 
 def wait_ready(base_url: str) -> None:
-    deadline = time.time() + 15
+    deadline = time.time() + 10
     while time.time() < deadline:
         try:
-            request_json("GET", f"{base_url}/v1/models")
-            return
+            status, _ = request_json("GET", f"{base_url}/v1/models")
+            if status == 200:
+                return
         except Exception:
-            time.sleep(0.2)
+            time.sleep(0.1)
     raise RuntimeError("legacy server did not start")
 
 
 def main() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
+        claude_root = tmp_path / "claude"
+        codex_root = tmp_path / "codex"
+        claude_user = claude_root / "users" / "golden"
+        codex_user = codex_root / "users" / "golden"
+        claude_user.mkdir(parents=True)
+        codex_user.mkdir(parents=True)
         codex_bin = tmp_path / "codex"
         codex_bin.write_text(
             "#!/bin/sh\n"
@@ -87,60 +75,69 @@ def main() -> None:
             encoding="utf-8",
         )
         codex_bin.chmod(0o755)
-        token_server = ThreadingHTTPServer(("127.0.0.1", 0), TokenHandler)
-        threading.Thread(target=token_server.serve_forever, daemon=True).start()
-        port = "19100"
-        env = os.environ.copy()
-        env.update(
+
+        old_values = {
+            "API_KEY": server.API_KEY,
+            "DISABLE_LEGACY": server.DISABLE_LEGACY,
+            "DEFAULT_CLAUDE_CONFIG_DIR": server.DEFAULT_CLAUDE_CONFIG_DIR,
+            "USER_CLAUDE_CONFIG_ROOT": server.USER_CLAUDE_CONFIG_ROOT,
+            "DEFAULT_CODEX_CONFIG_DIR": server.DEFAULT_CODEX_CONFIG_DIR,
+            "USER_CODEX_CONFIG_ROOT": server.USER_CODEX_CONFIG_ROOT,
+            "_exchange_code_for_token": server._exchange_code_for_token,
+        }
+        old_path = os.environ.get("PATH", "")
+        server.API_KEY = API_KEY
+        server.DISABLE_LEGACY = False
+        server.DEFAULT_CLAUDE_CONFIG_DIR = str(claude_root)
+        server.USER_CLAUDE_CONFIG_ROOT = str(claude_root / "users")
+        server.DEFAULT_CODEX_CONFIG_DIR = str(codex_root)
+        server.USER_CODEX_CONFIG_ROOT = str(codex_root / "users")
+        server._exchange_code_for_token = lambda code, verifier, state: (  # type: ignore[assignment]
+            200,
             {
-                "CC_API_KEY": API_KEY,
-                "CC_EXECUTOR_PORT": port,
-                "CC_DISABLE_LEGACY": "false",
-                "CC_OAUTH_TOKEN_URL": f"http://127.0.0.1:{token_server.server_port}/token",
-                "PATH": f"{tmp}:{env.get('PATH', '')}",
-                "CLAUDE_CONFIG_DIR": str(tmp_path / "claude"),
-                "CODEX_HOME": str(tmp_path / "codex-home"),
-            }
+                "access_token": "legacy-access-token",
+                "refresh_token": "legacy-refresh-token",
+                "expires_in": 60,
+                "scope": server._SCOPE,
+            },
         )
-        proc = subprocess.Popen(
-            [sys.executable, "server.py"],
-            cwd=str(ROOT),
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
+        os.environ["PATH"] = f"{tmp}:{old_path}"
+
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
         try:
-            base_url = f"http://127.0.0.1:{port}"
+            base_url = f"http://127.0.0.1:{httpd.server_port}"
             wait_ready(base_url)
             status, models = request_json("GET", f"{base_url}/v1/models")
             assert status == 200
             assert "data" in models
 
-            status, started = request_json("POST", f"{base_url}/admin/oauth/start", {})
-            assert status == 200
-            session_id = str(started["session_id"])
-            auth_url = str(started["url"])
-            state = re.search(r"[?&]state=([^&]+)", auth_url).group(1)  # type: ignore[union-attr]
+            claude_headers = {"X-Claude-Config-Dir": str(claude_user)}
+            status, started = request_json("POST", f"{base_url}/admin/oauth/start", {}, claude_headers)
+            assert status == 200, started
+            state = re.search(r"[?&]state=([^&]+)", str(started["url"])).group(1)  # type: ignore[union-attr]
             status, completed = request_json(
                 "POST",
                 f"{base_url}/admin/oauth/complete",
-                {"session_id": session_id, "code": f"legacy-code#{state}"},
+                {"session_id": started["session_id"], "code": f"legacy-code#{state}"},
+                claude_headers,
             )
             assert status == 200, completed
             assert completed["ok"] is True
+            assert (claude_user / ".credentials.json").exists()
 
-            status, codex = request_json("POST", f"{base_url}/admin/codex/login/start", {})
-            assert status == 200
-            assert codex["url"].startswith("https://auth.openai.com/codex/device")
+            codex_headers = {"X-Codex-Config-Dir": str(codex_user)}
+            status, codex = request_json("POST", f"{base_url}/admin/codex/login/start", {}, codex_headers)
+            assert status == 200, codex
+            assert str(codex["url"]).startswith("https://auth.openai.com/codex/device")
             assert codex["user_code"] == "MZHT-0HT0G"
         finally:
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-            token_server.shutdown()
+            httpd.shutdown()
+            thread.join(timeout=5)
+            os.environ["PATH"] = old_path
+            for name, value in old_values.items():
+                setattr(server, name, value)
             shutil.rmtree(tmp_path, ignore_errors=True)
     print("PASS legacy_golden_test")
 
