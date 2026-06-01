@@ -60,12 +60,14 @@ def main() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
         claude_root = tmp_path / "claude"
-        codex_root = tmp_path / "codex"
+        codex_root = tmp_path / "codex-home"
         claude_user = claude_root / "users" / "golden"
         codex_user = codex_root / "users" / "golden"
         claude_user.mkdir(parents=True)
         codex_user.mkdir(parents=True)
-        codex_bin = tmp_path / "codex"
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        codex_bin = bin_dir / "codex"
         codex_bin.write_text(
             "#!/bin/sh\n"
             "if [ \"$1\" = \"login\" ] && [ \"$2\" = \"--device-auth\" ]; then\n"
@@ -101,7 +103,7 @@ def main() -> None:
                 "scope": server._SCOPE,
             },
         )
-        os.environ["PATH"] = f"{tmp}:{old_path}"
+        os.environ["PATH"] = f"{bin_dir}:{old_path}"
 
         httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
         thread = threading.Thread(target=httpd.serve_forever, daemon=True)
