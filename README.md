@@ -29,6 +29,53 @@ auth or API-key fallback where supported.
 | POST | `/admin/codex/logout` | Bearer | Remove local Codex auth state for the selected `CODEX_HOME`. |
 | DELETE | `/admin/codex/config-dir` | Bearer | Delete one per-user Codex config directory selected by `X-Codex-Config-Dir`. |
 
+## webductor-wd-mode (additive)
+
+The `webductor-wd-mode` branch adds a WD execution surface for webductor while
+leaving the existing `/v1` and `/admin` APIs unchanged. vod-clip and other
+legacy integrations keep using the stdlib server on port `9100`; webductor
+deployments set `CC_DISABLE_LEGACY=true` and call the WD uvicorn server on
+port `9101`.
+
+`supervisor.py` starts both servers. The WD server exposes `/wd/*`, verifies the
+server-to-executor `Authorization: Bearer CC_API_KEY`, and requires a WD claim
+signed with `WD_CLAIM_SIGNING_SECRET`. The claim is an HMAC-SHA256 signature
+over `base64url(payload)` and binds each request body with `body_hash`, blocks
+replay with Redis `jti` `SET NX EX`, checks `exp`, validates UUID/enum shape,
+and strictly validates slot paths under `/data/auth/<provider>/users/<slot_id>`
+and `/data/ws/<tenant>/<chatroom>`.
+
+WD execution runs as a slot uid rather than root. Slot uids are allocated
+monotonically from `20000` to `60000`, stored in `/data/uid_registry.json` with
+`flock` and atomic writes, and are never reused. CLI subprocesses are started
+with `user=uid`, `group=uid`, `extra_groups=[]`, and `start_new_session=True`.
+`config_dir` and `ws_cwd` are owned by the slot uid with mode `0700`, and child
+environments strip service secrets such as `WD_CLAIM_SIGNING_SECRET`,
+`CC_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, and
+`CLAUDE_CODE_OAUTH_TOKEN`.
+
+WD endpoints:
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/wd/v1/run` | One-shot `claude --print` or `codex exec` as the slot uid. Only `tools_allowed=false` is enabled; `tools_allowed=true` returns `403` until a filesystem boundary stage exists. |
+| `POST` | `/wd/v1/login/start` | Start slot-scoped login. Claude uses PKCE and returns `auth_url`; Codex starts `codex login --device-auth` and returns `verification_url` plus `user_code`. |
+| `POST` | `/wd/v1/login/complete` | Complete Claude code exchange or poll a pending Codex device login. Completion is bound to the pending session's `slot_id`, `slot_tenant_id`, `tenant_id`, `requester_id`, and `provider`. |
+| `GET` | `/wd/v1/login/status` | Read slot credential status from the slot config directory only; no shared-env fallback. |
+| `DELETE` | `/wd/v1/login` | Remove slot credentials and cancel pending login state. |
+| `GET` | `/wd/health` | WD health, including `instance_id` and legacy-disabled state. |
+
+Login credentials are written only to the pending session's `config_dir`, never
+to a request-supplied path. Claude writes `.credentials.json`; Codex writes
+`auth.json`. Credential files are slot uid-owned with mode `0600`.
+
+The WD login flow is intentionally single-instance. `WD_UVICORN_WORKERS` must be
+`1`, `/data/.wd_executor.lock` is held with `flock`, and a second executor
+instance refuses to start. This protects in-memory Claude PKCE verifier state
+and pending Codex device-auth subprocesses. Scaling to multiple workers or
+replicas requires moving the Claude verifier and pending session state to an
+external TTL store.
+
 ### How to authenticate
 
 The **preferred** path is the built-in OAuth flow — the CLI does not have
