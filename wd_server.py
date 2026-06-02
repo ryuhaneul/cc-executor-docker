@@ -761,22 +761,30 @@ async def login_start(
         "created_at": time.time(),
         "expires_at": expires_at,
     }
-    with _LOGIN_LOCK:
-        if login_id in _LOGIN_SESSIONS:
-            raise HTTPException(status_code=409, detail="login_id already exists")
     if provider == "claude":
         state, code_verifier, auth_url = login_core.new_pkce()
         session["state"] = state
         session["code_verifier"] = code_verifier
         with _LOGIN_LOCK:
+            if login_id in _LOGIN_SESSIONS:
+                raise HTTPException(status_code=409, detail="login_id already exists")
             _LOGIN_SESSIONS[login_id] = session
         return {"ok": True, "provider": provider, "login_id": login_id, "auth_url": auth_url}
 
-    proc = _spawn_codex_login(config_dir, slot_uid)
+    with _LOGIN_LOCK:
+        if login_id in _LOGIN_SESSIONS:
+            raise HTTPException(status_code=409, detail="login_id already exists")
+        _LOGIN_SESSIONS[login_id] = session
+    try:
+        proc = _spawn_codex_login(config_dir, slot_uid)
+    except Exception:
+        _cleanup_login_session(login_id, session)
+        raise
     session["proc"] = proc
     session["output"] = ""
     with _LOGIN_LOCK:
-        _LOGIN_SESSIONS[login_id] = session
+        if _LOGIN_SESSIONS.get(login_id) is session:
+            _LOGIN_SESSIONS[login_id] = session
     threading.Thread(
         target=_read_codex_login_output,
         args=(login_id, proc),
