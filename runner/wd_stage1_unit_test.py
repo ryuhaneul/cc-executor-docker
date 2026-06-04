@@ -37,6 +37,60 @@ def test_claude_parser() -> None:
     assert model == "claude-sonnet"
 
 
+def test_claude_transcript_parser_extracts_final_result_usage_and_error() -> None:
+    transcript = "\n".join(
+        [
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "sessionId": "session-camel",
+                    "message": {
+                        "model": "claude-sonnet",
+                        "content": [{"type": "text", "text": "draft"}],
+                        "usage": {"input_tokens": 3, "output_tokens": 1},
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "result",
+                    "result": "final",
+                    "is_error": True,
+                    "usage": {"input_tokens": 5, "output_tokens": 2},
+                }
+            ),
+        ]
+    )
+
+    text, usage, session_id, model, is_error = wd_server._parse_claude_transcript(transcript)
+
+    assert text == "final"
+    assert usage == {"input_tokens": 5, "output_tokens": 2}
+    assert session_id == "session-camel"
+    assert model == "claude-sonnet"
+    assert is_error is True
+
+
+def test_claude_pty_terminal_query_responses() -> None:
+    response = wd_server._terminal_query_responses(b"\x1b[c\x1b[>0c\x1b[6n\x1b[>q\x1b[18t")
+
+    assert b"\x1b[?1;2c" in response
+    assert b"\x1b[>0;0;0c" in response
+    assert b"\x1b[1;1R" in response
+    assert b"\x1bP>|wd-pty-wrapper\x1b\\" in response
+    assert b"\x1b[8;40;120t" in response
+
+
+def test_claude_hook_line_requires_nonce() -> None:
+    payload = json.dumps({"transcript_path": "/tmp/t.jsonl"}).encode("utf-8")
+
+    assert wd_server._parse_hook_line(b"Stop\tgood\t" + payload, "good") == (
+        "Stop",
+        {"transcript_path": "/tmp/t.jsonl"},
+    )
+    assert wd_server._parse_hook_line(b"Stop\tbad\t" + payload, "good") is None
+
+
 def test_codex_parser() -> None:
     stdout = "\n".join(
         [
@@ -102,6 +156,82 @@ def test_claude_tools_false_argv_and_true_reject() -> None:
         raise AssertionError("tools_allowed=True must be rejected")
 
 
+def test_claude_print_runner_preserves_existing_argv() -> None:
+    argv = wd_server._build_claude_argv(
+        model="sonnet",
+        system_prompt="system",
+        resume="session-old",
+        tools_allowed=False,
+    )
+
+    assert argv == [
+        "claude",
+        "--print",
+        "--output-format",
+        "json",
+        "--setting-sources",
+        "",
+        "--model",
+        "sonnet",
+        "--system-prompt",
+        "system",
+        "--resume",
+        "session-old",
+        "--disallowedTools",
+        "*",
+    ]
+
+
+def test_claude_pty_wrapper_argv_omits_print_flag_and_external_binary() -> None:
+    argv = wd_server._build_claude_pty_argv(
+        settings_json='{"hooks":{}}',
+        model="sonnet",
+        system_prompt=None,
+        resume=None,
+        tools_allowed=False,
+    )
+
+    assert argv == [
+        "claude",
+        "--settings",
+        '{"hooks":{}}',
+        "--model",
+        "sonnet",
+        "--disallowedTools",
+        "*",
+    ]
+    assert "--print" not in argv
+    assert "-p" not in argv
+    assert "claude-p" not in argv
+
+
+def test_run_body_claude_runner_defaults_and_rejects_invalid_values() -> None:
+    assert wd_server._run_body({"prompt": "hello"})[4] == "print"
+    assert wd_server._run_body({"prompt": "hello", "claude_runner": None})[4] == "print"
+    assert wd_server._run_body({"prompt": "hello", "claude_runner": "print"})[4] == "print"
+    assert wd_server._run_body({"prompt": "hello", "claude_runner": "pty-wrapper"})[4] == "pty-wrapper"
+    assert wd_server._run_body({"prompt": "hello", "claude_runner": "claude-p"})[4] == "pty-wrapper"
+
+    for invalid in ("", "CLAUDE-P", "print ", [], {}):
+        try:
+            wd_server._run_body({"prompt": "hello", "claude_runner": invalid})
+        except wd_server.HTTPException as exc:
+            assert exc.status_code == 422
+        else:
+            raise AssertionError(f"claude_runner={invalid!r} must be rejected")
+
+
+def test_non_claude_runner_rejected() -> None:
+    wd_server._reject_unsupported_runner("codex", "print")
+    try:
+        wd_server._reject_unsupported_runner("codex", "pty-wrapper")
+    except wd_server.HTTPException as exc:
+        assert exc.status_code == 422
+        assert exc.detail == "claude_runner is only supported for provider=claude"
+    else:
+        raise AssertionError("codex claude_runner must be rejected")
+
+
 def test_execute_provider_uses_slot_identity_and_env() -> None:
     original = wd_server.subprocess.Popen
     calls: list[dict[str, object]] = []
@@ -131,6 +261,7 @@ def test_execute_provider_uses_slot_identity_and_env() -> None:
                 model="sonnet",
                 system_prompt="system",
                 resume=None,
+                claude_runner="print",
                 tools_allowed=False,
                 timeout=5,
                 config_dir=config_dir,
@@ -248,6 +379,7 @@ def test_codex_argv_env_and_last_message_file() -> None:
                 model="gpt-5-codex",
                 system_prompt=None,
                 resume="thread-old",
+                claude_runner="print",
                 tools_allowed=False,
                 timeout=5,
                 config_dir=config_dir,
@@ -408,8 +540,15 @@ def test_codex_auth_json_owner_mode_failure() -> None:
 
 if __name__ == "__main__":
     test_claude_parser()
+    test_claude_transcript_parser_extracts_final_result_usage_and_error()
+    test_claude_pty_terminal_query_responses()
+    test_claude_hook_line_requires_nonce()
     test_codex_parser()
     test_claude_tools_false_argv_and_true_reject()
+    test_claude_print_runner_preserves_existing_argv()
+    test_claude_pty_wrapper_argv_omits_print_flag_and_external_binary()
+    test_run_body_claude_runner_defaults_and_rejects_invalid_values()
+    test_non_claude_runner_rejected()
     test_execute_provider_uses_slot_identity_and_env()
     test_run_subprocess_timeout_kills_process_group()
     test_codex_non_resume_argv_has_no_literal_stdin_prompt()

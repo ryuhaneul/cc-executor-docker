@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import pty
 import re
+import select
 import signal
 import subprocess
 import tempfile
@@ -59,6 +61,13 @@ _SENSITIVE_PATTERNS = (
     re.compile(r"\b(?:sk|sk-proj|sk-ant|sk-codex)-[A-Za-z0-9._-]+"),
     re.compile(r"\b[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\b"),
 )
+CLAUDE_RUNNER_PRINT = "print"
+CLAUDE_RUNNER_PTY = "pty-wrapper"
+CLAUDE_RUNNER_ALIASES = {
+    "print": CLAUDE_RUNNER_PRINT,
+    "pty-wrapper": CLAUDE_RUNNER_PTY,
+    "claude-p": CLAUDE_RUNNER_PTY,
+}
 
 app = FastAPI(title="cc-executor webductor mode")
 INSTANCE_ID = os.environ.get("WD_INSTANCE_ID", str(uuid.uuid4()))
@@ -103,7 +112,7 @@ def _bounded_timeout(body: Mapping[str, Any]) -> int:
     return min(requested, MAX_TIMEOUT)
 
 
-def _run_body(body: Mapping[str, Any]) -> tuple[str, str | None, str | None, str | None, int]:
+def _run_body(body: Mapping[str, Any]) -> tuple[str, str | None, str | None, str | None, str, int]:
     prompt = body.get("prompt")
     if not isinstance(prompt, str) or not prompt:
         raise HTTPException(status_code=422, detail="prompt is required")
@@ -111,6 +120,7 @@ def _run_body(body: Mapping[str, Any]) -> tuple[str, str | None, str | None, str
     model = body.get("model")
     system_prompt = body.get("system_prompt")
     resume = body.get("resume")
+    raw_claude_runner = body.get("claude_runner")
     for name, value in (
         ("model", model),
         ("system_prompt", system_prompt),
@@ -118,8 +128,17 @@ def _run_body(body: Mapping[str, Any]) -> tuple[str, str | None, str | None, str
     ):
         if value is not None and not isinstance(value, str):
             raise HTTPException(status_code=422, detail=f"{name} must be a string")
+    if raw_claude_runner is None:
+        claude_runner = CLAUDE_RUNNER_PRINT
+    elif isinstance(raw_claude_runner, str) and raw_claude_runner in CLAUDE_RUNNER_ALIASES:
+        claude_runner = CLAUDE_RUNNER_ALIASES[raw_claude_runner]
+    else:
+        raise HTTPException(
+            status_code=422,
+            detail="claude_runner must be 'print', 'pty-wrapper', or 'claude-p'",
+        )
 
-    return prompt, model, system_prompt, resume, _bounded_timeout(body)
+    return prompt, model, system_prompt, resume, claude_runner, _bounded_timeout(body)
 
 
 def _provider_env(provider: str, config_dir: Path, ws_cwd: Path) -> dict[str, str]:
@@ -158,6 +177,25 @@ def _build_claude_argv(
     tools_allowed: bool,
 ) -> list[str]:
     argv = ["claude", "--print", "--output-format", "json", "--setting-sources", ""]
+    _append_common_claude_args(
+        argv,
+        model=model,
+        system_prompt=system_prompt,
+        resume=resume,
+        tools_allowed=tools_allowed,
+    )
+    return argv
+
+
+def _build_claude_pty_argv(
+    *,
+    settings_json: str,
+    model: str | None,
+    system_prompt: str | None,
+    resume: str | None,
+    tools_allowed: bool,
+) -> list[str]:
+    argv = ["claude", "--settings", settings_json]
     _append_common_claude_args(
         argv,
         model=model,
@@ -329,6 +367,144 @@ def _parse_codex_output(
     return text, usage, session_id, model
 
 
+def _terminal_query_responses(chunk: bytes) -> bytes:
+    responses: list[bytes] = []
+    if b"\x1b[c" in chunk or b"\x1b[0c" in chunk:
+        responses.append(b"\x1b[?1;2c")
+    if b"\x1b[>c" in chunk or b"\x1b[>0c" in chunk:
+        responses.append(b"\x1b[>0;0;0c")
+    if b"\x1b[6n" in chunk:
+        responses.append(b"\x1b[1;1R")
+    if b"\x1b[>q" in chunk or b"\x1b[>0q" in chunk:
+        responses.append(b"\x1bP>|wd-pty-wrapper\x1b\\")
+    if b"\x1b[18t" in chunk:
+        responses.append(b"\x1b[8;40;120t")
+    return b"".join(responses)
+
+
+_CSI_RE = re.compile(rb"\x1b\[[0-?]*[ -/]*[@-~]")
+_OSC_RE = re.compile(rb"\x1b\][^\x07]*(?:\x07|\x1b\\)")
+
+
+def _plain_terminal_text(raw: bytes) -> str:
+    without_osc = _OSC_RE.sub(b"", raw)
+    without_csi = _CSI_RE.sub(b"", without_osc)
+    return without_csi.decode("utf-8", errors="ignore").lower()
+
+
+def _build_claude_hook_settings(script_path: Path, nonce: str) -> str:
+    def hook(event: str) -> list[dict[str, object]]:
+        return [
+            {
+                "matcher": "*",
+                "hooks": [{"type": "command", "command": f"{script_path} {event} {nonce}"}],
+            },
+        ]
+
+    return json.dumps(
+        {"hooks": {"SessionStart": hook("SessionStart"), "Stop": hook("Stop")}},
+        separators=(",", ":"),
+    )
+
+
+def _write_claude_hook_script(path: Path, uid: int) -> None:
+    path.write_text(
+        "#!/bin/sh\n"
+        "set -eu\n"
+        "event=\"$1\"\n"
+        "nonce=\"$2\"\n"
+        "fifo=\"${WD_CLAUDE_HOOK_FIFO:?missing WD_CLAUDE_HOOK_FIFO}\"\n"
+        "payload=\"$(cat)\"\n"
+        "printf '%s\\t%s\\t%s\\n' \"$event\" \"$nonce\" \"$payload\" >> \"$fifo\"\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o700)
+    os.chown(path, uid, uid)
+
+
+def _parse_hook_line(line: bytes, expected_nonce: str) -> tuple[str, dict[str, Any]] | None:
+    raw = line.rstrip(b"\r\n")
+    parts = raw.split(b"\t", 2)
+    if len(parts) != 3:
+        return None
+    event, nonce, payload = parts
+    if nonce.decode(errors="replace") != expected_nonce:
+        return None
+    try:
+        parsed = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    return event.decode(errors="replace"), parsed
+
+
+def _parse_claude_transcript(raw: str) -> tuple[str, dict[str, Any], str | None, str | None, bool]:
+    final_text = ""
+    usage: dict[str, Any] = {}
+    session_id: str | None = None
+    model: str | None = None
+    is_error = False
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if session_id is None:
+            raw_session = event.get("sessionId") or event.get("session_id")
+            if isinstance(raw_session, str):
+                session_id = raw_session
+        if model is None and isinstance(event.get("model"), str):
+            model = str(event["model"])
+        event_type = event.get("type")
+        if event_type == "assistant":
+            message = event.get("message")
+            if isinstance(message, dict):
+                text = _content_text(message.get("content"))
+                if text:
+                    final_text = text
+                if isinstance(message.get("usage"), dict):
+                    usage = dict(message["usage"])
+                if model is None and isinstance(message.get("model"), str):
+                    model = str(message["model"])
+        elif event_type == "result":
+            result_text = event.get("result")
+            if isinstance(result_text, str):
+                final_text = result_text
+            if isinstance(event.get("is_error"), bool):
+                is_error = bool(event["is_error"])
+            if isinstance(event.get("usage"), dict):
+                usage = dict(event["usage"])
+            if isinstance(event.get("session_id"), str):
+                session_id = str(event["session_id"])
+            if isinstance(event.get("model"), str):
+                model = str(event["model"])
+    return final_text, usage, session_id, model, is_error
+
+
+def _read_claude_transcript(
+    path: str | None,
+    *,
+    fallback_text: str | None,
+) -> tuple[str, dict[str, Any], str | None, str | None, bool]:
+    if path:
+        for _ in range(20):
+            try:
+                raw = Path(path).read_text(encoding="utf-8")
+            except OSError:
+                raw = ""
+            if raw:
+                parsed = _parse_claude_transcript(raw)
+                if parsed[0] or parsed[4]:
+                    return parsed
+            time.sleep(0.05)
+    return fallback_text or "", {}, None, None, False if fallback_text else True
+
+
 def _run_subprocess(
     argv: list[str],
     *,
@@ -363,6 +539,184 @@ def _run_subprocess(
     return subprocess.CompletedProcess(argv, proc.returncode, stdout=stdout, stderr=stderr)
 
 
+def _run_claude_pty_wrapper(
+    *,
+    prompt: str,
+    model: str | None,
+    system_prompt: str | None,
+    resume: str | None,
+    tools_allowed: bool,
+    timeout: int,
+    cwd: Path,
+    env: Mapping[str, str],
+    slot_uid: int,
+) -> tuple[subprocess.CompletedProcess[str], str, dict[str, Any], str | None, str | None, list[str]]:
+    with tempfile.TemporaryDirectory(prefix=".wd-claude-pty-", dir=str(cwd)) as tmp_name:
+        tmp_dir = Path(tmp_name)
+        os.chown(tmp_dir, slot_uid, slot_uid)
+        os.chmod(tmp_dir, 0o700)
+        fifo_path = tmp_dir / "events.fifo"
+        hook_path = tmp_dir / "hook.sh"
+        os.mkfifo(fifo_path, 0o600)
+        os.chown(fifo_path, slot_uid, slot_uid)
+        _write_claude_hook_script(hook_path, slot_uid)
+
+        hook_nonce = uuid.uuid4().hex
+        settings_json = _build_claude_hook_settings(hook_path, hook_nonce)
+        argv = _build_claude_pty_argv(
+            settings_json=settings_json,
+            model=model,
+            system_prompt=system_prompt,
+            resume=resume,
+            tools_allowed=tools_allowed,
+        )
+        child_env = dict(env)
+        child_env["TERM"] = "xterm-256color"
+        child_env["WD_CLAUDE_HOOK_FIFO"] = str(fifo_path)
+
+        master_fd, slave_fd = pty.openpty()
+        fifo_fd = os.open(fifo_path, os.O_RDONLY | os.O_NONBLOCK)
+        fifo_keepalive_fd = os.open(fifo_path, os.O_WRONLY | os.O_NONBLOCK)
+        proc: subprocess.Popen[bytes] | None = None
+        pty_output = bytearray()
+        fifo_buffer = bytearray()
+        transcript_path: str | None = None
+        stop_payload: dict[str, Any] | None = None
+        prompt_sent = False
+        trust_dismissed = False
+        terminal_tail = b""
+        try:
+            proc = subprocess.Popen(
+                argv,
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                cwd=str(cwd),
+                env=child_env,
+                user=slot_uid,
+                group=slot_uid,
+                extra_groups=[],
+                start_new_session=True,
+                close_fds=True,
+            )
+            os.close(slave_fd)
+            slave_fd = -1
+            deadline = time.monotonic() + timeout
+            while stop_payload is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    _kill_process_group(proc)
+                    raise subprocess.TimeoutExpired(argv, timeout)
+                readable, _, _ = select.select([master_fd, fifo_fd], [], [], min(0.05, remaining))
+                for fd in readable:
+                    if fd == master_fd:
+                        try:
+                            chunk = os.read(master_fd, 4096)
+                        except OSError:
+                            chunk = b""
+                        if chunk:
+                            pty_output.extend(chunk)
+                            if len(pty_output) > 65536:
+                                del pty_output[: len(pty_output) - 65536]
+                            if not trust_dismissed:
+                                plain = _plain_terminal_text(bytes(pty_output[-8192:]))
+                                if "trust" in plain and ("folder" in plain or "project" in plain):
+                                    try:
+                                        os.write(master_fd, b"\r")
+                                    except OSError:
+                                        pass
+                                    trust_dismissed = True
+                            scan_bytes = terminal_tail + chunk
+                            terminal_tail = scan_bytes[-16:]
+                            response = _terminal_query_responses(scan_bytes)
+                            if response:
+                                try:
+                                    os.write(master_fd, response)
+                                except OSError:
+                                    pass
+                    elif fd == fifo_fd:
+                        try:
+                            chunk = os.read(fifo_fd, 4096)
+                        except BlockingIOError:
+                            chunk = b""
+                        if chunk:
+                            fifo_buffer.extend(chunk)
+                            while b"\n" in fifo_buffer:
+                                raw_line, _, rest = bytes(fifo_buffer).partition(b"\n")
+                                fifo_buffer = bytearray(rest)
+                                parsed_line = _parse_hook_line(raw_line, hook_nonce)
+                                if parsed_line is None:
+                                    continue
+                                event, payload = parsed_line
+                                raw_transcript = payload.get("transcript_path")
+                                if isinstance(raw_transcript, str):
+                                    transcript_path = raw_transcript
+                                if event == "SessionStart" and not prompt_sent:
+                                    time.sleep(0.08)
+                                    os.write(master_fd, b"\x1b[200~" + prompt.encode("utf-8") + b"\x1b[201~")
+                                    time.sleep(0.12)
+                                    os.write(master_fd, b"\r")
+                                    prompt_sent = True
+                                elif event == "Stop":
+                                    stop_payload = payload
+                                    break
+                if proc.poll() is not None and stop_payload is None:
+                    output = pty_output.decode("utf-8", errors="replace")
+                    return (
+                        subprocess.CompletedProcess(argv, proc.returncode or 1, stdout="", stderr=_mask_secrets(output.strip())),
+                        "",
+                        {},
+                        None,
+                        model,
+                        argv,
+                    )
+
+            raw_last = stop_payload.get("last_assistant_message") if stop_payload else None
+            fallback_text = raw_last if isinstance(raw_last, str) else None
+            if fallback_text is None and isinstance(raw_last, dict):
+                fallback_text = _content_text(raw_last.get("content") or raw_last.get("message"))
+            text, usage, session_id, actual_model, is_error = _read_claude_transcript(
+                transcript_path,
+                fallback_text=fallback_text,
+            )
+            if fallback_text:
+                text = fallback_text
+            if not session_id and stop_payload and isinstance(stop_payload.get("session_id"), str):
+                session_id = str(stop_payload["session_id"])
+            if not text and not is_error:
+                stderr = "Claude wrapper did not receive a final assistant message"
+                return subprocess.CompletedProcess(argv, 1, stdout="", stderr=stderr), "", {}, session_id, actual_model or model, argv
+            stdout = json.dumps(
+                {
+                    "type": "result",
+                    "result": text,
+                    "session_id": session_id,
+                    "model": actual_model or model,
+                    "usage": usage,
+                    "is_error": is_error,
+                },
+                separators=(",", ":"),
+            )
+            stderr = "assistant returned error" if is_error else ""
+            return (
+                subprocess.CompletedProcess(argv, 1 if is_error else 0, stdout=stdout, stderr=stderr),
+                text,
+                usage,
+                session_id,
+                actual_model or model,
+                argv,
+            )
+        finally:
+            if proc is not None:
+                _kill_process_group(proc)
+            for fd in (slave_fd, master_fd, fifo_fd, fifo_keepalive_fd):
+                if fd >= 0:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+
+
 def _reject_unsupported_tools(claims: Mapping[str, Any]) -> None:
     if bool(claims["tools_allowed"]):
         # Owner-private full-tools requires a later filesystem boundary stage
@@ -373,6 +727,14 @@ def _reject_unsupported_tools(claims: Mapping[str, Any]) -> None:
         )
 
 
+def _reject_unsupported_runner(provider: str, claude_runner: str) -> None:
+    if provider != "claude" and claude_runner != CLAUDE_RUNNER_PRINT:
+        raise HTTPException(
+            status_code=422,
+            detail="claude_runner is only supported for provider=claude",
+        )
+
+
 def _execute_provider(
     *,
     provider: str,
@@ -380,6 +742,7 @@ def _execute_provider(
     model: str | None,
     system_prompt: str | None,
     resume: str | None,
+    claude_runner: str,
     tools_allowed: bool,
     timeout: int,
     config_dir: Path,
@@ -388,6 +751,19 @@ def _execute_provider(
 ) -> tuple[subprocess.CompletedProcess[str], str, dict[str, Any], str | None, str | None, list[str], dict[str, str]]:
     env = _provider_env(provider, config_dir, ws_cwd)
     if provider == "claude":
+        if claude_runner == CLAUDE_RUNNER_PTY:
+            result, text, usage, session_id, actual_model, argv = _run_claude_pty_wrapper(
+                prompt=prompt,
+                model=model,
+                system_prompt=system_prompt,
+                resume=resume,
+                tools_allowed=tools_allowed,
+                timeout=timeout,
+                cwd=ws_cwd,
+                env=env,
+                slot_uid=slot_uid,
+            )
+            return result, text, usage, session_id, actual_model or model, argv, env
         argv = _build_claude_argv(
             model=model,
             system_prompt=system_prompt,
@@ -955,7 +1331,8 @@ async def run(
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"slot dir preparation failed: {exc}") from exc
 
-    prompt, model, system_prompt, resume, timeout = _run_body(body)
+    prompt, model, system_prompt, resume, claude_runner, timeout = _run_body(body)
+    _reject_unsupported_runner(str(claims["provider"]), claude_runner)
     started = time.time()
     try:
         result, text, usage, session_id, actual_model, _argv, env = _execute_provider(
@@ -964,6 +1341,7 @@ async def run(
             model=model,
             system_prompt=system_prompt,
             resume=resume,
+            claude_runner=claude_runner,
             tools_allowed=bool(claims["tools_allowed"]),
             timeout=timeout,
             config_dir=config_dir,

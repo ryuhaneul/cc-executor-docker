@@ -58,7 +58,7 @@ WD endpoints:
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/wd/v1/run` | One-shot `claude --print` or `codex exec` as the slot uid. Only `tools_allowed=false` is enabled; `tools_allowed=true` returns `403` until a filesystem boundary stage exists. |
+| `POST` | `/wd/v1/run` | One-shot `claude --print` or `codex exec` as the slot uid. Optional body field `claude_runner` accepts `"print"` (default), `"pty-wrapper"`, or `"claude-p"`; `"claude-p"` is a compatibility alias for the built-in PTY wrapper. Only `tools_allowed=false` is enabled; `tools_allowed=true` returns `403` until a filesystem boundary stage exists. |
 | `POST` | `/wd/v1/login/start` | Start slot-scoped login. Claude uses PKCE and returns `auth_url`; Codex starts `codex login --device-auth` and returns `verification_url` plus `user_code`. |
 | `POST` | `/wd/v1/login/complete` | Complete Claude code exchange or poll a pending Codex device login. Completion is bound to the pending session's `slot_id`, `slot_tenant_id`, `tenant_id`, `requester_id`, and `provider`. |
 | `GET` | `/wd/v1/login/status` | Read slot credential status from the slot config directory only; no shared-env fallback. |
@@ -68,6 +68,43 @@ WD endpoints:
 Login credentials are written only to the pending session's `config_dir`, never
 to a request-supplied path. Claude writes `.credentials.json`; Codex writes
 `auth.json`. Credential files are slot uid-owned with mode `0600`.
+
+For Claude requests, omitted `claude_runner` and `"print"` preserve the existing
+`claude --print --output-format json` subprocess path. `"pty-wrapper"` runs
+interactive `claude` in an internal PTY, injects per-run SessionStart/Stop hooks
+with inline `--settings`, feeds the prompt once, and returns the final transcript
+message in the same `/wd/v1/run` response shape. It does not install or invoke the
+external `claude-p` package.
+
+Runner details:
+
+- `claude_runner` is only meaningful for `provider=claude`; non-Claude requests
+  that set a non-default runner are rejected.
+- `"claude-p"` is accepted only as a compatibility alias for the built-in
+  `"pty-wrapper"` implementation. No npm `claude-p` package is installed,
+  vendored, downloaded, or executed.
+- The default print path remains the compatibility baseline and must continue
+  to produce `claude --print --output-format json --setting-sources ""`.
+- The PTY wrapper creates a per-run private temp directory, FIFO, hook script,
+  and nonce. The hook script relays only nonce-matching `SessionStart` and
+  `Stop` events. The wrapper responds to Claude/Ink terminal probes, sends the
+  prompt once after `SessionStart`, reads the transcript or Stop fallback, and
+  normalizes the result to the existing `/wd/v1/run` response shape.
+- The PTY wrapper is an opt-in workaround for possible `--print` restrictions;
+  it is not a long-running interactive session and does not add a Mode B API.
+
+### Deployment contract
+
+This repository is consumed by the Webductor deployment on the 101 server.
+Changes must be committed and pushed from the local checkout, then pulled on
+the deployment host before rebuilding the `cc-executor` image. Do not treat a
+local file copy as deployment. The expected flow is:
+
+1. Commit and push this repository.
+2. On the 101 server, pull the updated repository used by Webductor.
+3. Rebuild/recreate the compose services that include `cc-executor`.
+4. Smoke test the existing default print path first, then test the opt-in
+   `claude_runner` path if credentials and test scope allow it.
 
 The WD login flow is intentionally single-instance. `WD_UVICORN_WORKERS` must be
 `1`, `/data/.wd_executor.lock` is held with `flock`, and a second executor
